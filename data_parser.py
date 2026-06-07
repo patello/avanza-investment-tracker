@@ -6,6 +6,7 @@ import operator
 import json
 
 from datetime import date, datetime
+from collections import defaultdict
 from functools import reduce
 from database_handler import DatabaseHandler
 
@@ -209,6 +210,15 @@ class DataParser:
         cur = self.db.conn.cursor()
         existing_rows = cur.execute("SELECT date, account, transaction_type, asset_name, amount, price FROM transactions WHERE date >= ? and date <= ?",(min_date,max_date)).fetchall()
 
+        # Build existing group sums keyed by (date, account, transaction_type, asset_name).
+        # This catches consolidated rows that duplicate split-fill rows: e.g. if the DB
+        # has two partial fills (0.7951 + 0.0286 = 0.8237) and the CSV brings a single
+        # consolidated row (0.8237), the group sum matches and the row is skipped.
+        existing_group_sums = defaultdict(float)
+        for row in existing_rows:
+            key = (row[0], row[1], row[2], row[3])
+            existing_group_sums[key] += row[4]
+
         #Add transactions to database
         for transaction in avanza_data:
             if new_format:
@@ -232,11 +242,32 @@ class DataParser:
             # If special_cases is not None, handle special cases
             if self.special_cases != None:
                 row = self.special_cases.handle_special_cases(row)
-            # If row is not in existing_rows, add it to the database
+            # Group-level deduplication: check if any existing group has a matching sum.
+            # This prevents importing a consolidated row when split-fill rows already exist.
+            # Only applies to non-zero amount rows (trades, fees, etc.); zero-amount rows
+            # (deposits/withdrawals) use exact matching to avoid false positives where
+            # multiple transactions share the same group key but differ in total amount.
+            group_key = (row[0], row[1], row[2], row[3])
             if row[0:6] not in existing_rows:
-                logging.debug("Adding row to database: {}".format(row))
-                cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);',row)
-                rows_added += 1
+                # Exact row not present — check group sum to avoid splitting-vs-consolidation duplicates
+                if row[4] != 0.0:
+                    db_sum = existing_group_sums.get(group_key, 0.0)
+                    if abs(db_sum - row[4]) > 1e-6:
+                        # Group sums differ or group not present — genuinely new row.
+                        # Update running sum so later rows in the same group are handled correctly.
+                        existing_group_sums[group_key] += row[4]
+                        logging.debug("Adding row to database: {}".format(row))
+                        cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);',row)
+                        rows_added += 1
+                    else:
+                        # Group sum matches — consolidated row matches split-fill total — skip
+                        logging.debug("Row already in database (group sum duplicate): {}".format(row))
+                else:
+                    # Zero-amount row (deposit/withdrawal): fall back to exact matching via existing_rows
+                    # (existing_rows is still populated from DB, which was empty on first run so this is always new)
+                    logging.debug("Adding row to database: {}".format(row))
+                    cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);',row)
+                    rows_added += 1
             else:
                 logging.debug("Row already in database: {}".format(row))
 
