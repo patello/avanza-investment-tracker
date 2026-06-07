@@ -185,6 +185,7 @@ class DataParser:
     def add_data(self, file_path: str) -> int:
         """
         Takes a path to a csv file downloaded from Avanza and adds the data to the database.
+        Uses group-level deduplication to match split/combined transactions.
 
         Parameters:
         file_path (str): Path to csv file downloaded from Avanza.
@@ -192,71 +193,111 @@ class DataParser:
         Returns:
         int: Number of rows added to the database.
         """
-        # file_path = ./data/newdata.csv
         try:
             with open(file_path, "r", encoding="utf-8") as avanza_data_file:
                 avanza_data = csv.reader(avanza_data_file, delimiter=';')
-                # Detect CSV format version from header row
                 avanza_header_row = next(avanza_data)
                 new_format = "Transaktionsvaluta" in avanza_header_row
                 avanza_data = list(avanza_data)
         except UnicodeDecodeError:
             with open(file_path, "r", encoding="cp1252") as avanza_data_file:
                 avanza_data = csv.reader(avanza_data_file, delimiter=';')
-                # Detect CSV format version from header row
                 avanza_header_row = next(avanza_data)
                 new_format = "Transaktionsvaluta" in avanza_header_row
                 avanza_data = list(avanza_data)
 
-        # Find overlapping transactions to avoid adding douplicates
         max_date = max([datetime.strptime(row[0],"%Y-%m-%d") for row in avanza_data]).date()
         min_date = min([datetime.strptime(row[0],"%Y-%m-%d") for row in avanza_data]).date()
         logging.debug("Date range of transactions to be added: {} - {}".format(min_date,max_date))
 
-        # Variable to keep track of number of rows added to the database
         rows_added = 0
-
-        # Connect to database
         self.db.connect()
         cur = self.db.conn.cursor()
-        existing_rows = cur.execute("SELECT date, account, transaction_type, asset_name, amount, price FROM transactions WHERE date >= ? and date <= ?",(min_date,max_date)).fetchall()
 
-        #Add transactions to database
+        # 1. Fetch existing transactions in the date range
+        existing_transactions = cur.execute(
+            "SELECT date, account, transaction_type, asset_name, amount, price, isin FROM transactions WHERE date >= ? and date <= ?",
+            (min_date, max_date)
+        ).fetchall()
+
+        # 2. Group existing transactions in DB
+        existing_groups = {}
+        for tx in existing_transactions:
+            # tx: (date, account, transaction_type, asset_name, amount, price, isin)
+            # key: (date, account, transaction_type, isin_or_asset_name)
+            isin_val = tx[6]
+            asset_name = tx[3]
+            key = (tx[0], tx[1], tx[2], isin_val if (isin_val and isin_val.strip()) else asset_name)
+            if key not in existing_groups:
+                existing_groups[key] = []
+            existing_groups[key].append(tx)
+
+        # 3. Parse and group proposed CSV transactions
+        proposed_groups = {}
         for transaction in avanza_data:
             if new_format:
-                # New format: Datum;Konto;Typ;Värdepapper;Antal;Kurs;Belopp;Transaktionsvaluta;Courtage;Valutakurs;Instrumentvaluta;ISIN;Resultat
-                row = (\
-                    datetime.strptime(transaction[0], "%Y-%m-%d").date(),\
-                    transaction[1],transaction[2],transaction[3],\
-                    self.convert_number(transaction[4]),self.convert_number(transaction[5]),\
-                    self.convert_number(transaction[6]),self.convert_number(transaction[8]),\
-                    transaction[7],transaction[11]
-                    )
+                row = (
+                    datetime.strptime(transaction[0], "%Y-%m-%d").date(),
+                    transaction[1], transaction[2], transaction[3],
+                    self.convert_number(transaction[4]), self.convert_number(transaction[5]),
+                    self.convert_number(transaction[6]), self.convert_number(transaction[8]),
+                    transaction[7], transaction[11]
+                )
             else:
-                # Old format: Datum;Konto;Typ;Värdepapper;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
-                row = (\
-                    datetime.strptime(transaction[0], "%Y-%m-%d").date(),\
-                    transaction[1],transaction[2],transaction[3],\
-                    self.convert_number(transaction[4]),self.convert_number(transaction[5]),\
-                    self.convert_number(transaction[6]),self.convert_number(transaction[7]),\
-                    transaction[8],transaction[9]
-                    )
-            # If special_cases is not None, handle special cases
-            if self.special_cases != None:
-                row = self.special_cases.handle_special_cases(row)
-            # If row is not in existing_rows, add it to the database
-            if row[0:6] not in existing_rows:
-                logging.debug("Adding row to database: {}".format(row))
-                cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);',row)
-                rows_added += 1
-            else:
-                logging.debug("Row already in database: {}".format(row))
+                row = (
+                    datetime.strptime(transaction[0], "%Y-%m-%d").date(),
+                    transaction[1], transaction[2], transaction[3],
+                    self.convert_number(transaction[4]), self.convert_number(transaction[5]),
+                    self.convert_number(transaction[6]), self.convert_number(transaction[7]),
+                    transaction[8], transaction[9]
+                )
 
-        # Commit changes to database and disconnect
+            if self.special_cases is not None:
+                row = self.special_cases.handle_special_cases(row)
+
+            isin_val = row[9]
+            asset_name = row[3]
+            key = (row[0], row[1], row[2], isin_val if (isin_val and isin_val.strip()) else asset_name)
+
+            if key not in proposed_groups:
+                proposed_groups[key] = []
+            proposed_groups[key].append(row)
+
+        # 4. Perform group-level matching and insertion
+        for key, proposed_rows in proposed_groups.items():
+            existing_rows = existing_groups.get(key, [])
+
+            if not existing_rows:
+                # No existing transactions in this group, insert all
+                for row in proposed_rows:
+                    logging.debug("Adding row to database: {}".format(row))
+                    cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);', row)
+                    rows_added += 1
+            else:
+                # Compare sum of amount
+                sum_proposed = sum(row[4] for row in proposed_rows)
+                sum_existing = sum(tx[4] for tx in existing_rows)
+
+                if abs(sum_proposed - sum_existing) < 1e-4:
+                    # Group matches, skip duplicate
+                    logging.debug(f"Skipping duplicate transaction group for key {key} (proposed sum: {sum_proposed}, existing sum: {sum_existing})")
+                    continue
+                else:
+                    # Sums do not match, fall back to exact row-by-row matching
+                    for row in proposed_rows:
+                        matched = False
+                        for tx in existing_rows:
+                            # Match amount and price
+                            if abs(row[4] - tx[4]) < 1e-4 and abs(row[5] - tx[5]) < 1e-4:
+                                matched = True
+                                break
+                        if not matched:
+                            logging.debug("Adding row to database: {}".format(row))
+                            cur.execute('INSERT INTO transactions(date, account, transaction_type,asset_name,amount,price,total,courtage,currency,isin) VALUES(?,?,?,?,?,?,?,?,?,?);', row)
+                            rows_added += 1
+
         self.db.conn.commit()
         self.db.disconnect()
-
-        # Return number of rows added to the database
         logging.info("Added {} rows to the database".format(rows_added))
         return rows_added
     
