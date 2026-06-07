@@ -18,17 +18,26 @@ def asset_deposit_db(tmp_path):
     # Needs special cases to apply custom purchase price for Asset 2
     special_cases_file = tmp_path / "special_cases.json"
     special_cases_file.write_text("""
-    {
-        "2222222": [
-            {
-                "property": "Värdepapper/beskrivning",
-                "value": "Asset 2",
-                "new_data": {
-                    "Kurs": "10.0"
+    [
+        {
+            "condition": [
+                {
+                    "index": 1,
+                    "value": "2222222"
+                },
+                {
+                    "index": 3,
+                    "value": "Asset 2"
                 }
-            }
-        ]
-    }
+            ],
+            "replacement": [
+                {
+                    "index": 5,
+                    "value": "10.0"
+                }
+            ]
+        }
+    ]
     """)
     special_cases = SpecialCases(str(special_cases_file))
     
@@ -50,10 +59,12 @@ def asset_deposit_db(tmp_path):
         writer.writerow(["2019-04-08","2222222","Sälj","Asset 2","-50","12","600","SEK","-","-","SEK","SE000000002","600"])
         writer.writerow(["2019-04-08","3333333","Sälj","Asset 3","-20","60","1200","SEK","-","-","SEK","SE000000003","1200"])
         
-    parser = DataParser(DatabaseHandler(db_file), special_cases)
+    db_handler = DatabaseHandler(db_file)
+    parser = DataParser(db_handler, special_cases)
     parser.add_data(str(csv_file))
-    parser.process_all()
-    parser.close_connections()
+    db_handler.connect()
+    parser.process_transactions()
+    db_handler.disconnect()
     
     return db_file
 
@@ -68,16 +79,16 @@ def test_tillgangsinsattning_processing(asset_deposit_db):
         cursor = conn.cursor()
         
         # 1. Fallback scenario (Asset 1)
-        # Should retroactively deposit 1250 in 2019-02-01 (when the asset was deposited)
-        cursor.execute("SELECT active_base FROM cohort_data WHERE account='1111111' AND month='2019-02-01'")
+        # Should retroactively deposit 1250 in 2019-02-28 (when the asset was deposited)
+        cursor.execute("SELECT active_base FROM cohort_data WHERE account='1111111' AND month='2019-02-28'")
         res1 = cursor.fetchone()
         
         # 2. Special case scenario (Asset 2)
-        cursor.execute("SELECT active_base FROM cohort_data WHERE account='2222222' AND month='2019-02-01'")
+        cursor.execute("SELECT active_base FROM cohort_data WHERE account='2222222' AND month='2019-02-28'")
         res2 = cursor.fetchone()
         
         # 3. Standard scenario (Asset 3)
-        cursor.execute("SELECT active_base FROM cohort_data WHERE account='3333333' AND month='2019-02-01'")
+        cursor.execute("SELECT active_base FROM cohort_data WHERE account='3333333' AND month='2019-02-28'")
         res3 = cursor.fetchone()
 
         # Check Asset 1 (Fallback) -> Base should be 1250
