@@ -57,8 +57,12 @@ class SpecialCases:
         file_path (str): Path to json file containing special cases.
         """
         # Read special cases from json file
-        with open(file_path, "r") as special_cases_file:
-            special_cases = json.load(special_cases_file)
+        try:
+            with open(file_path, "r", encoding="utf-8") as special_cases_file:
+                special_cases = json.load(special_cases_file)
+        except UnicodeDecodeError:
+            with open(file_path, "r", encoding="cp1252") as special_cases_file:
+                special_cases = json.load(special_cases_file)
 
         # Define a mapping from operator strings to functions
         ops = {
@@ -189,12 +193,20 @@ class DataParser:
         int: Number of rows added to the database.
         """
         # file_path = ./data/newdata.csv
-        with open(file_path, "r") as avanza_data_file:
-            avanza_data = csv.reader(avanza_data_file, delimiter=';')
-            # Detect CSV format version from header row
-            avanza_header_row = next(avanza_data)
-            new_format = "Transaktionsvaluta" in avanza_header_row
-            avanza_data = list(avanza_data)
+        try:
+            with open(file_path, "r", encoding="utf-8") as avanza_data_file:
+                avanza_data = csv.reader(avanza_data_file, delimiter=';')
+                # Detect CSV format version from header row
+                avanza_header_row = next(avanza_data)
+                new_format = "Transaktionsvaluta" in avanza_header_row
+                avanza_data = list(avanza_data)
+        except UnicodeDecodeError:
+            with open(file_path, "r", encoding="cp1252") as avanza_data_file:
+                avanza_data = csv.reader(avanza_data_file, delimiter=';')
+                # Detect CSV format version from header row
+                avanza_header_row = next(avanza_data)
+                new_format = "Transaktionsvaluta" in avanza_header_row
+                avanza_data = list(avanza_data)
 
         # Find overlapping transactions to avoid adding douplicates
         max_date = max([datetime.strptime(row[0],"%Y-%m-%d") for row in avanza_data]).date()
