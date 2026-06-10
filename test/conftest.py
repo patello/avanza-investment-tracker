@@ -1,5 +1,6 @@
 import sys
-sys.path.insert(0, "..")
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../scripts')))
 """
 Pytest configuration for private network tests.
 
