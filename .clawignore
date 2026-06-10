@@ -1,0 +1,7 @@
+test/
+.github/
+.venv/
+.gitignore
+pytest.ini
+README.md
+LICENSE
