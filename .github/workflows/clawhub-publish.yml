@@ -54,7 +54,7 @@ jobs:
           
           if [ "$IS_NEWER" = "True" ]; then
             echo "Newer version detected. Publishing $LOCAL_VERSION to ClawHub..."
-            clawhub publish .
+            clawhub publish . --slug avanza-investment-tracker --version "$LOCAL_VERSION" --changelog "Automated release of version $LOCAL_VERSION"
           else
             echo "Version $LOCAL_VERSION already exists on ClawHub registry (latest: $PUBLISHED_VERSION). Skipping publish."
           fi
