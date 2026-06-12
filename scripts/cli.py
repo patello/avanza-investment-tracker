@@ -269,6 +269,12 @@ def status(args):
     print(f"  Assets: {db_stats.get('Assets', 0)}")
     print(f"  Capital: {db_stats.get('Capital', 0):.0f} SEK")
     
+    min_date, max_date = db.get_date_range()
+    if min_date and max_date:
+        print(f"  Date range: {min_date} to {max_date}")
+    elif min_date or max_date:
+        print(f"  Date range: {min_date or max_date}")
+    
     # Price freshness
     fresh, oldest_date = prices_are_fresh(db)
     price_status = "Fresh" if fresh else "Stale"

@@ -33,6 +33,7 @@ This project is a work in progress and will be updated as I go along.
     - **Period-specific**: Track performance of investments made in each month/year
     - **Accumulated**: See total portfolio value over time with assets carried forward
 - **Account filtering**: View statistics for any combination of accounts with full accumulated history support
+- **System status**: Check database statistics, price freshness, and transaction date range
 
 ## Installation
 
