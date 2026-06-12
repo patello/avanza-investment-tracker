@@ -461,6 +461,21 @@ class DatabaseHandler:
         cursor.execute("SELECT account_id, nickname FROM accounts WHERE nickname IS NOT NULL")
         return dict(cursor.fetchall())
 
+    def get_date_range(self) -> tuple:
+        """
+        Get the minimum and maximum transaction dates.
+        
+        Returns:
+        tuple: (min_date, max_date) as strings in YYYY-MM-DD format, or (None, None) if no transactions
+        """
+        if not self.conn:
+            raise Exception("Database connection not established.")
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT MIN(date), MAX(date) FROM transactions")
+        result = cursor.fetchone()
+        return (result[0], result[1]) if result else (None, None)
+
 
 # Example Usage
 if __name__ == "__main__":
