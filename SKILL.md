@@ -49,7 +49,7 @@ The skill provides logic. Your data stays private and portable.
 | `python scripts/cli.py stats` | Show performance stats |
 | `python scripts/cli.py stats --update-prices auto` | Update prices, then show stats |
 | `python scripts/cli.py accounts` | Show account summaries |
-| `python scripts/cli.py status` | Check system status |
+| `python scripts/cli.py status` | Check system status (incl. transaction date range) |
 | `python scripts/cli.py reset --confirm` | Clear database (DESTRUCTIVE) |
 
 All commands accept:
