@@ -33,6 +33,7 @@ This project is a work in progress and will be updated as I go along.
     - **Period-specific**: Track performance of investments made in each month/year
     - **Accumulated**: See total portfolio value over time with assets carried forward
 - **Account filtering**: View statistics for any combination of accounts with full accumulated history support
+- **System status**: Check database statistics, price freshness, and transaction date range
 
 ## Installation
 
@@ -48,7 +49,7 @@ python cli.py import data/your_transactions.csv
 # 2. Get statistics with automatic price updates
 python cli.py stats --update-prices auto --period year --deposits all
 
-# 3. Check system status anytime (includes transaction date range)
+# 3. Check system status anytime
 python cli.py status
 
 # 4. (Optional) Set default accounts for filtering
@@ -76,7 +77,7 @@ python cli.py import data/transactions.csv
 # Show statistics with smart updates (auto-updates prices if stale)
 python cli.py stats --update-prices auto --period year --deposits all
 
-# Check system status (transactions, prices, metadata, date range)
+# Check system status (transactions, prices, metadata)
 python cli.py status
 
 # Reset database state (mark all transactions as unprocessed)
@@ -242,18 +243,6 @@ The unified CLI provides all functionality in a streamlined interface:
 5. (Optional) Set account nicknames: `python cli.py settings account-nickname 1234567 "Savings"`
 6. View account summaries: `python cli.py accounts --update-prices auto`
 7. Check system status: `python cli.py status`
-
-**Status output includes transaction date range:**
-```
-=== Investment Tracker Status ===
-Database:
- Transactions: 930
- Processed: 930
- Unprocessed: 0
- Date range: 2017-12-01 to 2026-06-08
-Assets: 96
-Capital: 47431 SEK
-```
 
 **Advanced usage with account filtering:**
 ```bash
