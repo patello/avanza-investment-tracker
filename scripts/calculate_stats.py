@@ -1173,17 +1173,17 @@ class StatCalculator:
         today = datetime.today().date()
 
         if not force:
-            # Check if prices are already up to date for all currently held assets
-            # First check: any held assets missing prices?
+            # Check if prices are already up to date for all assets
+            # First check: any assets missing prices?
             result = cur.execute(
-                "SELECT COUNT(*) FROM assets WHERE amount > 0 AND latest_price_date IS NULL"
+                "SELECT COUNT(*) FROM assets WHERE latest_price_date IS NULL"
             ).fetchone()
             
             if result and result[0] > 0:
-                logging.debug(f"Price update needed: {result[0]} held assets missing prices")
+                logging.debug(f"Price update needed: {result[0]} assets missing prices")
             else:
-                # Second check: get oldest price date for assets with amount > 0
-                (latest_price_date_str,) = cur.execute("SELECT MIN(latest_price_date) FROM assets WHERE amount > 0").fetchone()
+                # Second check: get oldest price date for all assets
+                (latest_price_date_str,) = cur.execute("SELECT MIN(latest_price_date) FROM assets").fetchone()
                 # Even with detect_types=sqlite3.PARSE_DECLTYPES, the MIN function returns a string instead of a date object
                 # Therefore, we need to convert the string to a date object, if it exists
                 if latest_price_date_str is not None:
@@ -1197,7 +1197,7 @@ class StatCalculator:
                     return
         
 
-        assets = cur.execute("SELECT asset,asset_id FROM assets WHERE amount > 0").fetchall()
+        assets = cur.execute("SELECT asset,asset_id FROM assets").fetchall()
         
         # Current working endpoint (discovered 2026-02-27)
         url = "https://www.avanza.se/_api/search/filtered-search"
@@ -1212,6 +1212,7 @@ class StatCalculator:
 
         for (asset,asset_id) in assets:
             r = requests.post(url, headers=headers, json={"query": asset, "limit": 5}, timeout=10)
+            time.sleep(0.05)
 
             if r.status_code == 200:
                 resp = r.json()
@@ -1224,10 +1225,48 @@ class StatCalculator:
                         raw_price = price_str.replace("\u00a0", "").replace(" ", "").replace(",", ".")
                         try:
                             price = float(raw_price)
+                            price_date = today
+                            detail_success = False
+
+                            # Try to query detailed endpoints to resolve actual date and price
+                            asset_type = hit.get("type")
+                            order_book_id = hit.get("orderBookId")
+
+                            if asset_type and order_book_id:
+                                try:
+                                    if asset_type == "FUND":
+                                        fund_url = f"https://www.avanza.se/_api/fund-reference/reference/{order_book_id}"
+                                        r_detail = requests.get(fund_url, headers=headers, timeout=10)
+                                        time.sleep(0.05)
+                                        if r_detail.status_code == 200:
+                                            detail_data = r_detail.json()
+                                            nav = detail_data.get("nav")
+                                            nav_date_str = detail_data.get("navDate")
+                                            if nav is not None and nav_date_str:
+                                                price = float(nav)
+                                                price_date = datetime.strptime(nav_date_str[:10], "%Y-%m-%d").date()
+                                                detail_success = True
+                                    elif asset_type in ("STOCK", "CERTIFICATE"):
+                                        detail_url = f"https://www.avanza.se/_api/market-guide/{asset_type.lower()}/{order_book_id}"
+                                        r_detail = requests.get(detail_url, headers=headers, timeout=10)
+                                        time.sleep(0.05)
+                                        if r_detail.status_code == 200:
+                                            detail_data = r_detail.json()
+                                            quote = detail_data.get("quote")
+                                            if quote and isinstance(quote, dict):
+                                                last_val = quote.get("last")
+                                                updated_ts = quote.get("updated")
+                                                if last_val is not None and updated_ts is not None:
+                                                    price = float(last_val)
+                                                    price_date = datetime.fromtimestamp(updated_ts / 1000.0).date()
+                                                    detail_success = True
+                                except Exception as e:
+                                    logging.debug(f"Failed to fetch detail for {asset} ({asset_type}): {e}")
+
                             cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?",
-                                        (price, today, asset_id))
+                                        (price, price_date, asset_id))
                             cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'external')",
-                                        (asset_id, today, price))
+                                        (asset_id, price_date, price))
                         except ValueError:
                             logging.warning(f"Could not parse price '{price_str}' for asset {asset}")
                     else:

@@ -295,3 +295,129 @@ def test_historical_price_superseding_and_resolution(tmp_path):
     assert abs(ab_case_b - ab_baseline) > 1.0
     assert abs(ab_case_b - 12000.0) < 1e-2
 
+
+@patch('requests.get')
+@patch('requests.post')
+def test_update_prices_detailed_fetching(mock_post, mock_get, tmp_path):
+    """
+    Test that update_prices fetches detailed date and price information for
+    funds, stocks, and certificates, and falls back to today's date on failure.
+    """
+    db_file = tmp_path / "test_updater_detail.db"
+    db = DatabaseHandler(str(db_file))
+    db.connect()
+    cur = db.get_cursor()
+    
+    # Insert 4 assets: a Fund, a Stock, a Certificate, and a Fallback asset
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Avanza Global', 10)")
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('AstraZeneca', 5)")
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Valour Ethereum', 2)")
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Fallback Asset', 1)")
+    db.commit()
+    
+    fund_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Avanza Global'").fetchone()[0]
+    stock_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'AstraZeneca'").fetchone()[0]
+    cert_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Valour Ethereum'").fetchone()[0]
+    fallback_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Fallback Asset'").fetchone()[0]
+    
+    # Mock search API response based on the asset query
+    def mock_post_side_effect(url, headers=None, json=None, timeout=None):
+        query = json.get("query")
+        resp = MagicMock()
+        resp.status_code = 200
+        if query == "Avanza Global":
+            resp.json.return_value = {
+                "hits": [{
+                    "type": "FUND",
+                    "orderBookId": "878733",
+                    "price": {"last": "250,00"}
+                }]
+            }
+        elif query == "AstraZeneca":
+            resp.json.return_value = {
+                "hits": [{
+                    "type": "STOCK",
+                    "orderBookId": "5431",
+                    "price": {"last": "1800,00"}
+                }]
+            }
+        elif query == "Valour Ethereum":
+            resp.json.return_value = {
+                "hits": [{
+                    "type": "CERTIFICATE",
+                    "orderBookId": "1208273",
+                    "price": {"last": "16,00"}
+                }]
+            }
+        else: # Fallback Asset search hit
+            resp.json.return_value = {
+                "hits": [{
+                    "type": "UNKNOWN",
+                    "orderBookId": "9999",
+                    "price": {"last": "50,00"}
+                }]
+            }
+        return resp
+        
+    mock_post.side_effect = mock_post_side_effect
+    
+    # Mock get API response for detailed endpoints
+    def mock_get_side_effect(url, headers=None, timeout=None):
+        resp = MagicMock()
+        if "fund-reference/reference/878733" in url:
+            resp.status_code = 200
+            resp.json.return_value = {
+                "nav": 257.91,
+                "navDate": "2026-07-03T00:00:00"
+            }
+        elif "market-guide/stock/5431" in url:
+            resp.status_code = 200
+            resp.json.return_value = {
+                "quote": {
+                    "last": 1863.0,
+                    "updated": 1783094400643 # 2026-07-03
+                }
+            }
+        elif "market-guide/certificate/1208273" in url:
+            resp.status_code = 200
+            resp.json.return_value = {
+                "quote": {
+                    "last": 16.80,
+                    "updated": 1783094400561 # 2026-07-03
+                }
+            }
+        else:
+            resp.status_code = 404
+        return resp
+        
+    mock_get.side_effect = mock_get_side_effect
+    
+    stat_calc = StatCalculator(db)
+    stat_calc.update_prices(force=True)
+    
+    # Verify fund details recorded correctly
+    fund_price = cur.execute("SELECT price, price_date FROM asset_prices WHERE asset_id = ? AND source = 'external'", (fund_id,)).fetchone()
+    assert fund_price is not None
+    assert fund_price[0] == 257.91
+    assert str(fund_price[1]) == "2026-07-03"
+    
+    # Verify stock details recorded correctly
+    stock_price = cur.execute("SELECT price, price_date FROM asset_prices WHERE asset_id = ? AND source = 'external'", (stock_id,)).fetchone()
+    assert stock_price is not None
+    assert stock_price[0] == 1863.0
+    assert str(stock_price[1]) == "2026-07-03"
+    
+    # Verify certificate details recorded correctly
+    cert_price = cur.execute("SELECT price, price_date FROM asset_prices WHERE asset_id = ? AND source = 'external'", (cert_id,)).fetchone()
+    assert cert_price is not None
+    assert cert_price[0] == 16.80
+    assert str(cert_price[1]) == "2026-07-03"
+    
+    # Verify fallback asset recorded correctly with today's date
+    today = date.today()
+    fallback_price = cur.execute("SELECT price, price_date FROM asset_prices WHERE asset_id = ? AND source = 'external'", (fallback_id,)).fetchone()
+    assert fallback_price is not None
+    assert fallback_price[0] == 50.0
+    assert fallback_price[1] == today
+
+
