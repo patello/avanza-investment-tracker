@@ -214,3 +214,84 @@ def test_update_prices_records_history(mock_post, tmp_path):
     assert prices[0][0] == asset_id
     assert prices[0][2] == 123.45
     assert prices[0][3] == "external"
+
+
+def test_historical_price_superseding_and_resolution(tmp_path):
+    """
+    Test that historical prices resolved during a withdrawal are:
+    1. Correctly superseded by more recent transaction prices for an asset.
+    2. Correctly applied (affecting the cohort valuation) for assets with no newer transactions.
+    """
+    db_file = tmp_path / "test_fake_prices.db"
+    csv_file = tmp_path / "test_data.csv"
+    
+    # Write test CSV with transactions
+    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
+2020-01-15;1111;Insättning;Deposit;-;-;20000;0;SEK;;-
+2020-01-16;1111;Köp;Asset A;100;100;-10000;0;SEK;TESTA;-
+2020-01-16;1111;Köp;Asset B;100;100;-10000;0;SEK;TESTB;-
+2021-01-15;1111;Sälj;Asset A;-50;200;10000;0;SEK;TESTA;-
+2021-01-16;1111;Uttag;;-;-;-10000;0;SEK;;-
+"""
+    csv_file.write_text(csv_content, encoding="utf-8")
+    
+    def run_with_fake_prices(fake_prices=None):
+        if db_file.exists():
+            db_file.unlink()
+        db = DatabaseHandler(str(db_file))
+        parser = DataParser(db)
+        parser.add_data(str(csv_file))
+        
+        db.connect()
+        cur = db.get_cursor()
+        
+        # Step through transactions manually up to withdrawal, then inject fake prices
+        cur.execute("SELECT *, rowid FROM transactions ORDER BY date ASC, rowid ASC")
+        txs = cur.fetchall()
+        for tx in txs:
+            tx_type = tx[2]
+            if tx_type == "Insättning":
+                parser.handle_deposit(tx)
+            elif tx_type == "Köp":
+                parser.handle_purchase(tx)
+            elif tx_type == "Sälj":
+                parser.handle_sale(tx)
+            elif tx_type == "Tillgångsinsättning":
+                parser.handle_asset_deposit(tx)
+            elif tx_type == "Uttag":
+                if fake_prices:
+                    for asset_name, p_date, p_val in fake_prices:
+                        (asset_id,) = cur.execute("SELECT asset_id FROM assets WHERE asset = ?", (asset_name,)).fetchone()
+                        cur.execute(
+                            "INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'external')",
+                            (asset_id, p_date, p_val)
+                        )
+                    db.commit()
+                parser.handle_withdrawal(tx)
+                
+        cur.execute("SELECT active_base FROM cohort_data WHERE month = '2020-01-31'")
+        active_base = cur.fetchone()[0]
+        
+        cur.close()
+        parser._data_cur = None
+        parser._transaction_cur = None
+        db.disconnect()
+        return active_base
+
+    # 1. Baseline Case: active_base drops from 20000 to 13333.33 (since Asset A = 50*200=10k, Asset B = 100*100=10k, Cash = 10k)
+    ab_baseline = run_with_fake_prices()
+    assert abs(ab_baseline - 13333.3333) < 1e-2
+    
+    # 2. Case A: Inject fake price for Asset A (999.0) on 2020-06-01.
+    # Since Asset A has a newer transaction price (200.0) on 2021-01-15, the fake price should be superseded.
+    # Resulting active_base must be identical to baseline.
+    ab_case_a = run_with_fake_prices([("Asset A", "2020-06-01", 999.0)])
+    assert abs(ab_case_a - ab_baseline) < 1e-4
+    
+    # 3. Case B: Inject fake price for Asset B (50.0) on 2020-06-01.
+    # Since Asset B has no newer transaction price, the fake price is resolved and reduces its valuation,
+    # which alters the active_base reduction.
+    ab_case_b = run_with_fake_prices([("Asset B", "2020-06-01", 50.0)])
+    assert abs(ab_case_b - ab_baseline) > 1.0
+    assert abs(ab_case_b - 12000.0) < 1e-2
+
