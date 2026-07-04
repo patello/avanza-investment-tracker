@@ -137,6 +137,56 @@ def import_data(args):
 
 
 
+def parse_date_bound(date_str, is_start_bound=False):
+    """
+    Parse a date string that can be YYYY, YYYY-MM, or YYYY-MM-DD.
+    If is_start_bound is True:
+        - YYYY resolves to YYYY-01-01
+        - YYYY-MM resolves to YYYY-MM-01
+    If is_start_bound is False:
+        - YYYY resolves to YYYY-12-31
+        - YYYY-MM resolves to YYYY-MM-<last_day_of_month>
+    """
+    if not date_str:
+        return None
+    
+    import calendar
+    from datetime import date
+    
+    date_str = date_str.strip()
+    
+    # 1. Try YYYY-MM-DD
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+        
+    # 2. Try YYYY-MM
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m")
+        year, month = dt.year, dt.month
+        if is_start_bound:
+            return date(year, month, 1)
+        else:
+            last_day = calendar.monthrange(year, month)[1]
+            return date(year, month, last_day)
+    except ValueError:
+        pass
+        
+    # 3. Try YYYY
+    try:
+        if len(date_str) == 4 and date_str.isdigit():
+            year = int(date_str)
+            if is_start_bound:
+                return date(year, 1, 1)
+            else:
+                return date(year, 12, 31)
+    except ValueError:
+        pass
+        
+    raise ValueError(f"Invalid date format: '{date_str}'. Supported formats: YYYY, YYYY-MM, YYYY-MM-DD")
+
+
 def stats(args):
     """Smart statistics command with automatic updates."""
     db = get_db(args)
@@ -158,7 +208,26 @@ def stats(args):
         # Comma-separated list of accounts
         accounts = [acc.strip() for acc in account_arg.split(',')]
     
-    # Update prices if needed
+    # Parse as_of, start_date, end_date
+    as_of = None
+    start_date = None
+    end_date = None
+    
+    try:
+        as_of = parse_date_bound(getattr(args, 'as_of', None), is_start_bound=False)
+        start_date = parse_date_bound(getattr(args, 'start_date', None), is_start_bound=True)
+        end_date = parse_date_bound(getattr(args, 'end_date', None), is_start_bound=False)
+        
+        # If both are specified, start_date and end_date/as_of work together
+        if as_of is not None and end_date is None:
+            end_date = as_of
+    except ValueError as e:
+        logging.error(str(e))
+        return 1
+
+    has_date_filters = (as_of is not None or start_date is not None or end_date is not None)
+
+    # Update prices if needed (only if not running past historical query or if force)
     if args.update_prices == 'always':
         # Force price update
         fresh, oldest_date = prices_are_fresh(db)
@@ -180,7 +249,7 @@ def stats(args):
             logging.error(f"Failed to update prices: {e}")
             return 1
             
-    elif args.update_prices == 'auto':
+    elif args.update_prices == 'auto' and not has_date_filters:
         fresh, oldest_date = prices_are_fresh(db)
         need_prices = any_assets_need_prices(db)
         
@@ -211,7 +280,7 @@ def stats(args):
     # Force recalculation if APY mode changed
     last_apy_mode = db.get_metadata('last_apy_mode') or 'modified-dietz'
     apy_mode_changed = (apy_mode != last_apy_mode)
-    if args.force or apy_mode_changed or stats_need_recalculation(db):
+    if not has_date_filters and (args.force or apy_mode_changed or stats_need_recalculation(db)):
         try:
             stat_calc = StatCalculator(db)
             stat_calc.calculate_cohort_stats(apy_mode=apy_mode)
@@ -228,14 +297,79 @@ def stats(args):
             return 1
     
     # Display statistics
+    temp_db = None
+    temp_db_path = None
     try:
-        stat_calc = StatCalculator(db)
-        # Get default period if needed
+        if has_date_filters:
+            import shutil
+            import os
+            import time
+            
+            # Determine target_date: the end bound of calculations
+            target_date = end_date if end_date is not None else as_of
+            if target_date is None:
+                target_date = datetime.today().date()
+                
+            temp_db_path = f"{db.db_file}_temp_as_of_{int(time.time())}.db"
+            shutil.copy2(db.db_file, temp_db_path)
+            
+            temp_db = DatabaseHandler(temp_db_path)
+            temp_db.connect()
+            
+            # Delete transactions after target_date
+            temp_cur = temp_db.get_cursor()
+            temp_cur.execute("DELETE FROM transactions WHERE date > ?", (target_date.isoformat(),))
+            
+            # Reset tables
+            temp_db.reset_table("cohort_data")
+            temp_db.reset_table("cohort_assets")
+            temp_db.reset_table("cohort_cash_flows")
+            temp_db.reset_table("assets")
+            temp_cur.execute("UPDATE transactions SET processed = 0")
+            temp_db.commit()
+            
+            # Run parser
+            special_cases = SpecialCases(args.special_cases) if getattr(args, 'special_cases', None) else None
+            parser = DataParser(temp_db, special_cases)
+            parser.process_transactions()
+            
+            # Resolve prices as of target_date
+            assets = temp_cur.execute("SELECT asset_id FROM assets").fetchall()
+            for (asset_id,) in assets:
+                price_row = temp_cur.execute("""
+                    SELECT price, price_date FROM asset_prices
+                    WHERE asset_id = ? AND price_date <= ?
+                    ORDER BY price_date DESC LIMIT 1
+                """, (asset_id, target_date.isoformat())).fetchone()
+                if price_row:
+                    temp_cur.execute("""
+                        UPDATE assets
+                        SET latest_price = ?, latest_price_date = ?
+                        WHERE asset_id = ?
+                    """, (price_row[0], price_row[1], asset_id))
+            temp_db.commit()
+            
+            # Calculate stats dynamically
+            stat_calc = StatCalculator(temp_db)
+            stat_calc.calculate_cohort_stats(apy_mode=apy_mode, today=target_date)
+            stat_calc.calculate_year_stats(apy_mode=apy_mode, today=target_date)
+            
+            active_db = temp_db
+        else:
+            active_db = db
+            
+        stat_calc = StatCalculator(active_db)
         period = args.period
         if period == 'default':
-            period = db.get_metadata('default_stats_period') or 'month'
+            period = active_db.get_metadata('default_stats_period') or 'month'
 
-        kwargs = {'period': period, 'deposits': args.deposits, 'apy_mode': apy_mode}
+        kwargs = {
+            'period': period,
+            'deposits': args.deposits,
+            'apy_mode': apy_mode,
+            'start_date': start_date,
+            'end_date': end_date
+        }
         
         # Add account filter if specified
         if accounts is not None:
@@ -250,6 +384,16 @@ def stats(args):
     except Exception as e:
         logging.error(f"Failed to show statistics: {e}")
         return 1
+    finally:
+        if temp_db is not None:
+            temp_db.disconnect()
+            import gc
+            gc.collect()
+            if temp_db_path and os.path.exists(temp_db_path):
+                try:
+                    os.remove(temp_db_path)
+                except Exception as e:
+                    logging.warning(f"Failed to remove temp db file: {e}")
 
 
 def status(args):
@@ -531,6 +675,21 @@ Examples:
         choices=['modified-dietz', 'twrr'],
         default='modified-dietz',
         help='APY calculation method (default: modified-dietz)'
+    )
+    stats_parser.add_argument(
+        '--as-of',
+        default=None,
+        help='Show statistics as of a previous date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--start-date',
+        default=None,
+        help='Start date for filtering statistics (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--end-date',
+        default=None,
+        help='End date for filtering statistics (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.set_defaults(func=stats)
     

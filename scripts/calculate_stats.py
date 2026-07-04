@@ -19,6 +19,26 @@ class StatCalculator:
         self.db = db
 
     @staticmethod
+    def _filter_by_date_range(stats, start_date, end_date):
+        filtered_stats = []
+        for row in stats:
+            row_date = row[0]
+            if isinstance(row_date, str):
+                if '-' in row_date:
+                    rd = datetime.strptime(row_date, "%Y-%m-%d").date()
+                else:
+                    rd = date(int(row_date), 12, 31)
+            else:
+                rd = row_date
+            
+            if start_date is not None and rd < start_date:
+                continue
+            if end_date is not None and rd > end_date:
+                continue
+            filtered_stats.append(row)
+        return filtered_stats
+
+    @staticmethod
     def _modified_dietz_hpr(deposit, total_gainloss, value, start_date, parsed_cfs, today):
         """
         Compute Modified Dietz Holding Period Return (HPR) for a single cohort.
@@ -325,7 +345,7 @@ class StatCalculator:
             deposit, total_gainloss, value, start_date, parsed_cfs, today)
         return self._annualize_hpr(hpr, total_days)
 
-    def calculate_cohort_stats(self, apy_mode='modified-dietz'):
+    def calculate_cohort_stats(self, apy_mode='modified-dietz', today=None):
         """
         Calculate monthly stats such as capital transfers and gain/loss.
         Stores results in account_cohort_stats table (per account).
@@ -340,7 +360,8 @@ class StatCalculator:
         self.db.reset_table("account_cohort_stats")
         
         cur = self.db.get_cursor()
-        today = datetime.today().date()
+        if today is None:
+            today = datetime.today().date()
         
         # Get all accounts
         accounts = [row[0] for row in cur.execute(
@@ -466,7 +487,7 @@ class StatCalculator:
         self.db.commit()
         logging.info(f"Monthly stats calculated for {len(accounts)} accounts")
             
-    def calculate_year_stats(self, apy_mode='modified-dietz'):
+    def calculate_year_stats(self, apy_mode='modified-dietz', today=None):
         """
         Calculate yearly stats from monthly stats.
         Stores results in account_year_stats table (per account).
@@ -481,7 +502,8 @@ class StatCalculator:
         self.db.reset_table("account_year_stats")
         
         cur = self.db.get_cursor()
-        today = datetime.today().date()
+        if today is None:
+            today = datetime.today().date()
         
         # Get all accounts
         accounts = [row[0] for row in cur.execute(
@@ -642,7 +664,7 @@ class StatCalculator:
         self.calculate_cohort_stats(apy_mode=apy_mode)
         self.calculate_year_stats(apy_mode=apy_mode)
 
-    def get_stats(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz") -> list:
+    def get_stats(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz", start_date=None, end_date=None) -> list:
         """
         Get stats such as capital transfers and gain/loss for either months or years.
         "deposits" determine if only months/years with non-withdrawn capital are returned or all months/years.
@@ -704,6 +726,10 @@ class StatCalculator:
             # Filter by deposits parameter
             if deposits == "current":
                 stats = [row for row in stats if row[3] > 0]  # value > 0
+                
+            # Filter by date range if start_date/end_date is specified
+            if start_date is not None or end_date is not None:
+                stats = self._filter_by_date_range(stats, start_date, end_date)
             
             return stats
         
@@ -831,10 +857,14 @@ class StatCalculator:
         # Filter by deposits parameter
         if deposits == "current":
             stats = [row for row in stats if row[3] > 0]  # value > 0
+            
+        # Filter by start_date / end_date range
+        if start_date is not None or end_date is not None:
+            stats = self._filter_by_date_range(stats, start_date, end_date)
         
         return stats
 
-    def get_accumulated(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz") -> list:
+    def get_accumulated(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz", start_date=None, end_date=None) -> list:
         """
         Get accumulated stats such as capital transfers and gain/loss for either months or years.
         "deposits" determine if only months/years with non-withdrawn capital are returned or all months/years.
@@ -882,6 +912,10 @@ class StatCalculator:
                 if deposits == "current" and row[2] <= 0:  # acc_value <= 0
                     continue
                 stats.append(tuple(row))
+                
+            # Filter by date range if start_date/end_date is specified
+            if start_date is not None or end_date is not None:
+                stats = self._filter_by_date_range(stats, start_date, end_date)
             
             return stats
         
@@ -929,6 +963,10 @@ class StatCalculator:
                 continue
                 
             stats.append((time_val, total_deposit, total_value, total_gainloss))
+            
+        # Filter by start_date / end_date range
+        if start_date is not None or end_date is not None:
+            stats = self._filter_by_date_range(stats, start_date, end_date)
         
         return stats
 

@@ -421,3 +421,88 @@ def test_update_prices_detailed_fetching(mock_post, mock_get, tmp_path):
     assert fallback_price[1] == today
 
 
+def test_parse_date_bound():
+    from cli import parse_date_bound
+    # Test YYYY
+    assert parse_date_bound("2022", is_start_bound=True) == date(2022, 1, 1)
+    assert parse_date_bound("2022", is_start_bound=False) == date(2022, 12, 31)
+    
+    # Test YYYY-MM
+    assert parse_date_bound("2022-02", is_start_bound=True) == date(2022, 2, 1)
+    assert parse_date_bound("2022-02", is_start_bound=False) == date(2022, 2, 28)
+    assert parse_date_bound("2024-02", is_start_bound=False) == date(2024, 2, 29) # Leap year
+    
+    # Test YYYY-MM-DD
+    assert parse_date_bound("2022-06-15", is_start_bound=True) == date(2022, 6, 15)
+    assert parse_date_bound("2022-06-15", is_start_bound=False) == date(2022, 6, 15)
+    
+    # Test None/empty
+    assert parse_date_bound(None) is None
+    assert parse_date_bound("") is None
+    
+    # Test invalid
+    with pytest.raises(ValueError):
+        parse_date_bound("invalid")
+
+
+def test_stats_date_range_filtering(tmp_path):
+    db_file = tmp_path / "test_filter_stats.db"
+    db = DatabaseHandler(str(db_file))
+    db.connect()
+    db.create_tables()
+    
+    # Initialize per-account tables
+    stat_calc = StatCalculator(db)
+    stat_calc._ensure_per_account_tables()
+    
+    # Setup mock tables and stats data
+    cur = db.get_cursor()
+    db.reset_table("account_cohort_stats")
+    
+    # Insert cohort stats rows for various months
+    data = [
+        ('A1', '2021-01-31', 100.0, 0.0, 110.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 5.0, 100.0, 100.0, 110.0, 10.0, 10.0),
+        ('A1', '2021-06-30', 200.0, 0.0, 220.0, 20.0, 0.0, 20.0, 10.0, 0.0, 10.0, 6.0, 300.0, 300.0, 330.0, 30.0, 30.0),
+        ('A1', '2022-01-31', 500.0, 0.0, 550.0, 50.0, 0.0, 50.0, 10.0, 0.0, 10.0, 7.0, 800.0, 800.0, 880.0, 80.0, 80.0),
+        ('A1', '2022-12-31', 1000.0, 0.0, 1100.0, 100.0, 0.0, 100.0, 10.0, 0.0, 10.0, 8.0, 1800.0, 1800.0, 1980.0, 180.0, 180.0)
+    ]
+    
+    for row in data:
+        cur.execute("""
+            INSERT INTO account_cohort_stats (
+                account, month, deposit, withdrawal, value,
+                total_gainloss, realized_gainloss, unrealized_gainloss,
+                total_gainloss_per, realized_gainloss_per, unrealized_gainloss_per,
+                annual_per_yield, acc_net_deposit, acc_deposit, acc_value,
+                acc_unrealized_gainloss, acc_total_gainloss
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, row)
+    db.commit()
+    
+    stat_calc = StatCalculator(db)
+    
+    # Test filtering with start_date and end_date
+    res_filtered = stat_calc.get_stats(
+        accounts=['A1'], period='month', deposits='all',
+        start_date=date(2021, 6, 1), end_date=date(2022, 6, 1)
+    )
+    
+    # Should only return '2021-06-30' and '2022-01-31'
+    assert len(res_filtered) == 2
+    assert res_filtered[0][0] == date(2021, 6, 30)
+    assert res_filtered[1][0] == date(2022, 1, 31)
+    
+    # Test get_accumulated with start_date and end_date
+    acc_filtered = stat_calc.get_accumulated(
+        accounts=['A1'], period='month', deposits='all',
+        start_date=date(2022, 1, 1)
+    )
+    # Should return '2022-01-31' and '2022-12-31'
+    assert len(acc_filtered) == 2
+    assert acc_filtered[0][0] == date(2022, 1, 31)
+    assert acc_filtered[1][0] == date(2022, 12, 31)
+    
+    db.disconnect()
+
+
+
