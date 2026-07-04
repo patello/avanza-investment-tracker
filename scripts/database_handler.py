@@ -222,6 +222,26 @@ class DatabaseHandler:
                 PRIMARY KEY(year)
                 );""")
 
+        # asset_prices contains historical asset prices from both transaction events and external API fetches
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS asset_prices(
+                asset_id INTEGER NOT NULL,
+                price_date DATE NOT NULL,
+                price REAL NOT NULL,
+                source TEXT CHECK(source IN ('transaction', 'external')),
+                PRIMARY KEY(asset_id, price_date),
+                FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+                );""")
+
+        # Retroactive Migration: populate asset_prices with historical transaction prices from processed transactions
+        cursor.execute("""
+            INSERT OR IGNORE INTO asset_prices (asset_id, price_date, price, source)
+            SELECT a.asset_id, t.date, t.price, 'transaction'
+            FROM transactions t
+            JOIN assets a ON t.asset_name = a.asset
+            WHERE t.processed = 1 AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning')
+            """)
+
         # Migrate: add transfer_net column if missing (existing databases)
         try:
             cursor.execute("ALTER TABLE cohort_data ADD COLUMN transfer_net REAL DEFAULT 0")

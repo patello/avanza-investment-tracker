@@ -1226,6 +1226,8 @@ class StatCalculator:
                             price = float(raw_price)
                             cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?",
                                         (price, today, asset_id))
+                            cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'external')",
+                                        (asset_id, today, price))
                         except ValueError:
                             logging.warning(f"Could not parse price '{price_str}' for asset {asset}")
                     else:

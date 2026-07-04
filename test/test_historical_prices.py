@@ -1,0 +1,216 @@
+import pytest
+from unittest.mock import patch, MagicMock
+from datetime import date
+from database_handler import DatabaseHandler
+from data_parser import DataParser
+from calculate_stats import StatCalculator
+
+
+def test_retroactive_migration(tmp_path):
+    """
+    Test that retroactive migration query works correctly to populate asset_prices.
+    """
+    db_file = str(tmp_path / "test_migration.db")
+    db = DatabaseHandler(db_file)
+    db.connect()
+    
+    # Manually insert assets and processed transactions directly
+    cur = db.get_cursor()
+    cur.execute("INSERT INTO assets (asset) VALUES ('Asset A')")
+    cur.execute("INSERT INTO assets (asset) VALUES ('Asset B')")
+    asset_a_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Asset A'").fetchone()[0]
+    asset_b_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Asset B'").fetchone()[0]
+    
+    # Insert processed transactions
+    cur.execute("""
+        INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, processed)
+        VALUES ('2023-01-01', '1111', 'Köp', 'Asset A', 10, 100, -1000, 0, 'SEK', 'TESTA', 1)
+    """)
+    cur.execute("""
+        INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, processed)
+        VALUES ('2023-01-02', '1111', 'Sälj', 'Asset A', -5, 120, 600, 0, 'SEK', 'TESTA', 1)
+    """)
+    cur.execute("""
+        INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, processed)
+        VALUES ('2023-01-03', '1111', 'Tillgångsinsättning', 'Asset B', 5, 50, 0, 0, 'SEK', 'TESTB', 1)
+    """)
+    
+    # Insert unprocessed and non-matching type transactions (should not be migrated)
+    cur.execute("""
+        INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, processed)
+        VALUES ('2023-01-04', '1111', 'Köp', 'Asset A', 10, 150, -1500, 0, 'SEK', 'TESTA', 0)
+    """)
+    cur.execute("""
+        INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, processed)
+        VALUES ('2023-01-05', '1111', 'Ränta', 'Asset A', 0, 10, 10, 0, 'SEK', 'TESTA', 1)
+    """)
+    
+    db.commit()
+    
+    # Drop the asset_prices table so we can trigger retroactive migration afresh
+    cur.execute("DROP TABLE IF EXISTS asset_prices")
+    db.commit()
+    
+    # Re-run create_tables() which triggers retroactive migration
+    db.create_tables()
+    
+    # Verify migration results
+    prices = cur.execute("SELECT asset_id, price_date, price, source FROM asset_prices ORDER BY price_date").fetchall()
+    
+    # Only the three processed transactions of valid types should be migrated
+    assert len(prices) == 3
+    
+    # First: Köp Asset A at 100 on 2023-01-01
+    assert prices[0][0] == asset_a_id
+    assert str(prices[0][1]) == "2023-01-01"
+    assert prices[0][2] == 100.0
+    assert prices[0][3] == "transaction"
+    
+    # Second: Sälj Asset A at 120 on 2023-01-02
+    assert prices[1][0] == asset_a_id
+    assert str(prices[1][1]) == "2023-01-02"
+    assert prices[1][2] == 120.0
+    assert prices[1][3] == "transaction"
+    
+    # Third: Tillgångsinsättning Asset B at 50 on 2023-01-03
+    assert prices[2][0] == asset_b_id
+    assert str(prices[2][1]) == "2023-01-03"
+    assert prices[2][2] == 50.0
+    assert prices[2][3] == "transaction"
+
+
+def test_parser_price_recording(tmp_path):
+    """
+    Test that when DataParser processes new transactions,
+    it records the prices in the asset_prices table.
+    """
+    db_file = tmp_path / "test_parser.db"
+    csv_file = tmp_path / "test_data.csv"
+    
+    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
+2023-01-01;1111;Insättning;Deposit;-;-;10000;0;SEK;;-
+2023-01-02;1111;Köp;Asset A;10;100;-1000;0;SEK;TESTA;-
+2023-01-03;1111;Köp;Asset A;5;120;-600;0;SEK;TESTA;-
+2023-01-04;1111;Sälj;Asset A;-5;150;750;0;SEK;TESTA;-
+2023-01-05;1111;Tillgångsinsättning;Asset B;10;50;0;0;SEK;TESTB;-
+"""
+    csv_file.write_text(csv_content, encoding="utf-8")
+    
+    db = DatabaseHandler(str(db_file))
+    parser = DataParser(db)
+    parser.add_data(str(csv_file))
+    parser.process_transactions()
+    
+    db.connect()
+    cur = db.get_cursor()
+    
+    # Verify that asset_prices was populated during processing
+    rows = cur.execute("""
+        SELECT a.asset, ap.price_date, ap.price, ap.source
+        FROM asset_prices ap
+        JOIN assets a ON ap.asset_id = a.asset_id
+        ORDER BY ap.price_date ASC
+    """).fetchall()
+    
+    assert len(rows) == 4
+    
+    # 2023-01-02 Köp Asset A at 100
+    assert rows[0] == ("Asset A", date(2023, 1, 2), 100.0, "transaction")
+    # 2023-01-03 Köp Asset A at 120
+    assert rows[1] == ("Asset A", date(2023, 1, 3), 120.0, "transaction")
+    # 2023-01-04 Sälj Asset A at 150
+    assert rows[2] == ("Asset A", date(2023, 1, 4), 150.0, "transaction")
+    # 2023-01-05 Tillgångsinsättning Asset B at 50
+    assert rows[3] == ("Asset B", date(2023, 1, 5), 50.0, "transaction")
+
+
+def test_cohort_value_resolution(tmp_path):
+    """
+    Test that cohort_value correctly resolves prices using historical asset_prices
+    when as_of_date is provided.
+    """
+    db_file = tmp_path / "test_cohort.db"
+    db = DatabaseHandler(str(db_file))
+    db.connect()
+    cur = db.get_cursor()
+    
+    # Create asset and cohort asset
+    cur.execute("INSERT INTO assets (asset, latest_price) VALUES ('Asset A', 200.0)")
+    asset_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Asset A'").fetchone()[0]
+    
+    # Insert cohort_data and cohort_assets
+    cur.execute("""
+        INSERT INTO cohort_data (month, account, deposit, active_base, capital)
+        VALUES ('2023-01-01', '1111', 1000.0, 1000.0, 0.0)
+    """)
+    cur.execute("""
+        INSERT INTO cohort_assets (month, asset_id, account, amount, average_price)
+        VALUES ('2023-01-01', ?, '1111', 10, 100.0)
+    """, (asset_id,))
+    
+    # Insert price history:
+    # On 2023-01-15, price was 100
+    # On 2023-02-15, price was 150
+    # On 2023-03-15, price was 180
+    cur.execute("INSERT INTO asset_prices (asset_id, price_date, price, source) VALUES (?, '2023-01-15', 100.0, 'transaction')", (asset_id,))
+    cur.execute("INSERT INTO asset_prices (asset_id, price_date, price, source) VALUES (?, '2023-02-15', 150.0, 'transaction')", (asset_id,))
+    cur.execute("INSERT INTO asset_prices (asset_id, price_date, price, source) VALUES (?, '2023-03-15', 180.0, 'transaction')", (asset_id,))
+    db.commit()
+    
+    parser = DataParser(db)
+    
+    # 1. Without as_of_date, uses latest_price (200.0)
+    val_latest = parser.cohort_value(date(2023, 1, 1), '1111')
+    assert val_latest == 2000.0  # 10 shares * 200.0
+    
+    # 2. As of 2023-01-20, closest price on or before is 100.0 (from 2023-01-15)
+    val_jan = parser.cohort_value(date(2023, 1, 1), '1111', as_of_date=date(2023, 1, 20))
+    assert val_jan == 1000.0  # 10 shares * 100.0
+    
+    # 3. As of 2023-02-28, closest price on or before is 150.0 (from 2023-02-15)
+    val_feb = parser.cohort_value(date(2023, 1, 1), '1111', as_of_date=date(2023, 2, 28))
+    assert val_feb == 1500.0  # 10 shares * 150.0
+    
+    # 4. As of 2023-01-01 (before any price in history), falls back to latest_price (200.0)
+    val_before = parser.cohort_value(date(2023, 1, 1), '1111', as_of_date=date(2023, 1, 1))
+    assert val_before == 2000.0
+
+
+@patch('requests.post')
+def test_update_prices_records_history(mock_post, tmp_path):
+    """
+    Test that update_prices records fetched prices in the asset_prices table.
+    """
+    db_file = tmp_path / "test_updater.db"
+    db = DatabaseHandler(str(db_file))
+    db.connect()
+    cur = db.get_cursor()
+    
+    # Insert held asset
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Asset A', 10)")
+    asset_id = cur.execute("SELECT asset_id FROM assets WHERE asset = 'Asset A'").fetchone()[0]
+    db.commit()
+    
+    # Mock Avanza search API response
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "hits": [
+            {
+                "price": {
+                    "last": "123,45"
+                }
+            }
+        ]
+    }
+    mock_post.return_value = mock_resp
+    
+    stat_calc = StatCalculator(db)
+    stat_calc.update_prices(force=True)
+    
+    # Check that it updated asset_prices table
+    prices = cur.execute("SELECT asset_id, price_date, price, source FROM asset_prices").fetchall()
+    assert len(prices) == 1
+    assert prices[0][0] == asset_id
+    assert prices[0][2] == 123.45
+    assert prices[0][3] == "external"

@@ -310,6 +310,7 @@ class DataParser:
         self.db.reset_table("cohort_assets")
         self.db.reset_table("assets")
         self.db.reset_table("cohort_cash_flows")
+        self.db.reset_table("asset_prices")
         self.db.commit()
 
     def allocate_to_month(self, transaction_date: date) -> date:
@@ -338,15 +339,16 @@ class DataParser:
         day = calendar.monthrange(year,month)[1]
         return date(year,month,day)
 
-    def cohort_value(self, cohort_month, account: str) -> float:
+    def cohort_value(self, cohort_month, account: str, as_of_date = None) -> float:
         """
-        Calculate the estimated current value of a cohort (month + account).
-        Value = cash (capital) + sum(asset_amount * last_seen_price).
-        Uses latest_price from the assets table as the last seen transaction price.
+        Calculate the estimated value of a cohort (month + account).
+        Value = cash (capital) + sum(asset_amount * price).
+        Uses asset_prices history if as_of_date is provided, otherwise latest_price.
 
         Parameters:
         cohort_month: The cohort month date.
         account (str): The account name.
+        as_of_date: Resolve prices as of this date.
 
         Returns:
         float: Estimated cohort value.
@@ -358,13 +360,29 @@ class DataParser:
         ).fetchone()
         cash = row[0] if row else 0.0
 
-        # Get asset values for this cohort using latest_price from assets table
-        asset_value = self.data_cur.execute("""
-            SELECT COALESCE(SUM(ma.amount * COALESCE(a.latest_price, ma.average_price)), 0)
-            FROM cohort_assets ma
-            JOIN assets a ON ma.asset_id = a.asset_id
-            WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
-        """, (cohort_month, account)).fetchone()[0]
+        # Get asset values for this cohort using latest price
+        if as_of_date is not None:
+            asset_value = self.data_cur.execute("""
+                SELECT COALESCE(SUM(ma.amount * COALESCE(
+                    (SELECT price FROM asset_prices WHERE asset_id = ma.asset_id AND price_date <= ? ORDER BY price_date DESC LIMIT 1),
+                    a.latest_price,
+                    ma.average_price
+                )), 0)
+                FROM cohort_assets ma
+                JOIN assets a ON ma.asset_id = a.asset_id
+                WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
+            """, (as_of_date, cohort_month, account)).fetchone()[0]
+        else:
+            asset_value = self.data_cur.execute("""
+                SELECT COALESCE(SUM(ma.amount * COALESCE(
+                    a.latest_price,
+                    (SELECT price FROM asset_prices WHERE asset_id = ma.asset_id ORDER BY price_date DESC LIMIT 1),
+                    ma.average_price
+                )), 0)
+                FROM cohort_assets ma
+                JOIN assets a ON ma.asset_id = a.asset_id
+                WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
+            """, (cohort_month, account)).fetchone()[0]
 
         return cash + asset_value
 
@@ -447,7 +465,7 @@ class DataParser:
                 month_amount = min(remaining_amount,capital)
 
                 # Calculate withdrawal fraction R and reduce active_base proportionally
-                cv = self.cohort_value(oldest_available, account)
+                cv = self.cohort_value(oldest_available, account, as_of_date=transaction_date)
                 if cv > 1e-4:
                     r = month_amount / cv
                     r = min(r, 1.0)  # Cap at 100%
@@ -499,6 +517,7 @@ class DataParser:
         total_amount = -row[6]
         date = row[0]
         self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         remaining_amount = total_amount
         month_capital = self.available_capital(account)
         total_capital = sum(e[1] for e in month_capital)
@@ -538,6 +557,7 @@ class DataParser:
         total_amount = row[6]
         date = row[0]
         self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         remaining_amount = asset_amount
         month_asset_amounts = self.available_asset(asset_id, account)
 
@@ -719,6 +739,7 @@ class DataParser:
         asset_id = self.data_cur.execute("SELECT asset_id FROM assets WHERE asset = ?",(asset,)).fetchone()[0]
         date = row[0]
         self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         self.data_cur.execute("INSERT OR IGNORE INTO cohort_assets(month,asset_id,account) VALUES (?,?,?)",(month,asset_id,account))
         # Update average price and average purchase price
         self.data_cur.execute("UPDATE cohort_assets SET average_price = (? * ? + amount * average_price) / (amount + ?) WHERE month = ? AND asset_id = ? AND account = ?", (amount, price, amount, month, asset_id, account))
@@ -811,7 +832,7 @@ class DataParser:
                 allocations.append((oldest_available, month_amount))
                 
                 # Calculate withdrawal fraction R and reduce active_base for OUT account
-                cv = self.cohort_value(oldest_available, out_account)
+                cv = self.cohort_value(oldest_available, out_account, as_of_date=out_date)
                 if cv > 1e-4:
                     r = month_amount / cv
                     r = min(r, 1.0)
