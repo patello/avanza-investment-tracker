@@ -1,8 +1,8 @@
 name: Publish to ClawHub
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -11,50 +11,51 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 0 # Fetch all history and tags to allow diffing
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          
+
       - name: Install ClawHub CLI
         run: npm install -g clawhub
-        
-      - name: Check version and Publish
+
+      - name: Inject Git Tag Version into _meta.json
+        run: |
+          REF_NAME="${{ github.ref_name }}"
+          if [[ "$REF_NAME" =~ ^v[0-9] ]]; then
+            VERSION="${REF_NAME#v}"
+            echo "Injecting tag version $VERSION into _meta.json"
+            jq --arg ver "$VERSION" '.version = $ver' _meta.json > temp.json && mv temp.json _meta.json
+          else
+            echo "Not triggered by a version tag (ref: $REF_NAME). Keeping version from _meta.json."
+          fi
+
+      - name: Generate Changelog
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          if [[ "$CURRENT_TAG" =~ ^v[0-9] ]]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)
+            if [ -z "$PREV_TAG" ]; then
+              echo "No previous tag found. Generating changelog from beginning of history."
+              git log "${CURRENT_TAG}" --format="- %s" > changelog.txt
+            else
+              echo "Generating changelog between $PREV_TAG and $CURRENT_TAG."
+              git log "${PREV_TAG}..${CURRENT_TAG}" --format="- %s" > changelog.txt
+            fi
+          else
+            echo "Not a tag release. Generating changelog from last 5 commits."
+            git log -n 5 --format="- %s" > changelog.txt
+          fi
+
+      - name: Publish to ClawHub
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
         run: |
-          # 1. Login to ClawHub
           clawhub login --token "$CLAWHUB_TOKEN"
-          
-          # 2. Get local version from _meta.json
-          LOCAL_VERSION=$(jq -r '.version' _meta.json)
-          echo "Local version in repo: $LOCAL_VERSION"
-          
-          # 3. Get published version from ClawHub registry (fallback to 0.0.0 if not found)
-          PUBLISHED_VERSION=$(clawhub inspect avanza-investment-tracker --json | jq -r '.version' 2>/dev/null || echo "0.0.0")
-          echo "Latest published version: $PUBLISHED_VERSION"
-          
-          # 4. Compare versions
-          IS_NEWER=$(python3 -c "
-          import sys
-          def parse(v):
-              # Strip potential 'v' prefix and split by '.'
-              parts = v.lstrip('v').split('.')
-              # Filter out any non-numeric suffixes (e.g. 2.0.3-alpha -> 2.0.3)
-              numeric_parts = []
-              for p in parts:
-                  num = ''.join(c for c in p if c.isdigit())
-                  numeric_parts.append(int(num) if num else 0)
-              return tuple(numeric_parts)
-          local_v = parse('$LOCAL_VERSION')
-          pub_v = parse('$PUBLISHED_VERSION')
-          print(local_v > pub_v)
-          ")
-          
-          if [ "$IS_NEWER" = "True" ]; then
-            echo "Newer version detected. Publishing $LOCAL_VERSION to ClawHub..."
-            clawhub publish . --slug avanza-investment-tracker --version "$LOCAL_VERSION" --changelog "Automated release of version $LOCAL_VERSION"
-          else
-            echo "Version $LOCAL_VERSION already exists on ClawHub registry (latest: $PUBLISHED_VERSION). Skipping publish."
-          fi
+          SLUG=$(jq -r '.slug' _meta.json)
+          VERSION=$(jq -r '.version' _meta.json)
+          CHANGELOG=$(cat changelog.txt)
+          clawhub publish . --slug "$SLUG" --version "$VERSION" --changelog "$CHANGELOG"
