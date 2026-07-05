@@ -772,7 +772,7 @@ def portfolio(args):
         return summaries
 
     if start_date is not None:
-        # Comparison mode: show change from start_date to end_date
+        # Comparison mode: show change from start_date to end_date (pure market return)
         start_vals = get_snapshot(start_date)
         end_vals = get_snapshot(end_date)
         
@@ -780,15 +780,37 @@ def portfolio(args):
         for account in accounts:
             s_val = start_vals[account]['total']
             e_val = end_vals[account]['total']
-            change = e_val - s_val
-            pct = (change / s_val * 100) if s_val > 0 else 0.0
+            
+            # Query cash flows
+            cur.execute("""
+                SELECT COALESCE(SUM(total), 0) FROM transactions
+                WHERE account = ? AND date > ? AND date <= ?
+                AND transaction_type IN ('Insättning', 'Autogiroinsättning', 'Uttag', 'Intern överföring')
+            """, (account, start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date, end_date.isoformat() if hasattr(end_date, 'isoformat') else end_date))
+            cash_flow = cur.fetchone()[0]
+            
+            # Query asset flows
+            cur.execute("""
+                SELECT COALESCE(SUM(amount * price), 0) FROM transactions
+                WHERE account = ? AND date > ? AND date <= ?
+                AND transaction_type = 'Tillgångsinsättning'
+            """, (account, start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date, end_date.isoformat() if hasattr(end_date, 'isoformat') else end_date))
+            asset_flow = cur.fetchone()[0]
+            
+            net_dep = cash_flow + asset_flow
+            ret_sek = e_val - s_val - net_dep
+            ret_pct = (ret_sek / s_val * 100) if s_val > 0 else 0.0
+            total_change = e_val - s_val
+            
             comparison.append({
                 'account': account,
                 'display_name': get_display_name(account),
                 'start_value': s_val,
                 'end_value': e_val,
-                'change': change,
-                'percent_change': pct
+                'net_deposits': net_dep,
+                'return_sek': ret_sek,
+                'return_percent': ret_pct,
+                'total_change': total_change
             })
             
         if args.format == 'json':
@@ -801,27 +823,41 @@ def portfolio(args):
                 
             total_start = sum(c['start_value'] for c in comparison)
             total_end = sum(c['end_value'] for c in comparison)
-            total_change = total_end - total_start
-            total_pct = (total_change / total_start * 100) if total_start > 0 else 0.0
+            total_net_deposits = sum(c['net_deposits'] for c in comparison)
+            total_return_sek = total_end - total_start - total_net_deposits
+            total_return_pct = (total_return_sek / total_start * 100) if total_start > 0 else 0.0
+            total_change_sek = total_end - total_start
             
             name_width = max(max(len(c['display_name']) for c in comparison), 7)
-            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Change (SEK)':>14} {'Change (%)':>12}"
+            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Net Deposits':>14} {'Return (SEK)':>14} {'Return (%)':>12} {'Total Change':>14}"
             print(header)
             print("-" * len(header))
             
             for c in comparison:
-                change_sign = "+" if c['change'] > 0 else ""
-                pct_sign = "+" if c['percent_change'] > 0 else ""
-                change_str = f"{change_sign}{c['change']:,.0f}"
-                pct_str = f"{pct_sign}{c['percent_change']:.1f}%"
-                print(f"{c['display_name']:<{name_width}} {c['start_value']:>12.0f} {c['end_value']:>12.0f} {change_str:>14} {pct_str:>12}")
+                dep_sign = "+" if c['net_deposits'] > 0 else ""
+                ret_sign = "+" if c['return_sek'] > 0 else ""
+                pct_sign = "+" if c['return_percent'] > 0 else ""
+                chg_sign = "+" if c['total_change'] > 0 else ""
+                
+                dep_str = f"{dep_sign}{c['net_deposits']:,.0f}" if c['net_deposits'] != 0 else "0"
+                ret_str = f"{ret_sign}{c['return_sek']:,.0f}"
+                pct_str = f"{pct_sign}{c['return_percent']:.1f}%"
+                chg_str = f"{chg_sign}{c['total_change']:,.0f}"
+                
+                print(f"{c['display_name']:<{name_width}} {c['start_value']:>12.0f} {c['end_value']:>12.0f} {dep_str:>14} {ret_str:>14} {pct_str:>12} {chg_str:>14}")
                 
             print("-" * len(header))
-            total_change_sign = "+" if total_change > 0 else ""
-            total_pct_sign = "+" if total_pct > 0 else ""
-            total_change_str = f"{total_change_sign}{total_change:,.0f}"
-            total_pct_str = f"{total_pct_sign}{total_pct:.1f}%"
-            print(f"{'TOTAL':<{name_width}} {total_start:>12.0f} {total_end:>12.0f} {total_change_str:>14} {total_pct_str:>12}")
+            total_dep_sign = "+" if total_net_deposits > 0 else ""
+            total_ret_sign = "+" if total_return_sek > 0 else ""
+            total_pct_sign = "+" if total_return_pct > 0 else ""
+            total_chg_sign = "+" if total_change_sek > 0 else ""
+            
+            total_dep_str = f"{total_dep_sign}{total_net_deposits:,.0f}" if total_net_deposits != 0 else "0"
+            total_ret_str = f"{total_ret_sign}{total_return_sek:,.0f}"
+            total_pct_str = f"{total_pct_sign}{total_return_pct:.1f}%"
+            total_chg_str = f"{total_chg_sign}{total_change_sek:,.0f}"
+            
+            print(f"{'TOTAL':<{name_width}} {total_start:>12.0f} {total_end:>12.0f} {total_dep_str:>14} {total_ret_str:>14} {total_pct_str:>12} {total_chg_str:>14}")
             
     else:
         # Single snapshot mode
