@@ -248,6 +248,72 @@ class DatabaseHandler:
         except Exception:
             pass  # Column already exists
 
+        # Create helper SQL views
+        cursor.execute("DROP VIEW IF EXISTS v_account_asset_holdings;")
+        cursor.execute("""
+            CREATE VIEW v_account_asset_holdings AS
+            SELECT 
+                account, 
+                asset_name, 
+                SUM(amount) AS held_amount
+            FROM transactions
+            WHERE transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+            GROUP BY account, asset_name
+            HAVING ABS(SUM(amount)) > 0.0001;
+        """)
+
+        cursor.execute("DROP VIEW IF EXISTS v_account_current_valuations;")
+        cursor.execute("""
+            CREATE VIEW v_account_current_valuations AS
+            SELECT 
+                acc.account,
+                COALESCE((
+                    SELECT SUM(total) 
+                    FROM transactions 
+                    WHERE account = acc.account
+                ), 0.0) AS cash,
+                COALESCE((
+                    SELECT SUM(t.amount * a.latest_price)
+                    FROM transactions t
+                    JOIN assets a ON t.asset_name = a.asset
+                    WHERE t.account = acc.account 
+                      AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                ), 0.0) AS assets,
+                COALESCE((
+                    SELECT SUM(total) 
+                    FROM transactions 
+                    WHERE account = acc.account
+                ), 0.0) +
+                COALESCE((
+                    SELECT SUM(t.amount * a.latest_price)
+                    FROM transactions t
+                    JOIN assets a ON t.asset_name = a.asset
+                    WHERE t.account = acc.account 
+                      AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                ), 0.0) AS total
+            FROM (SELECT DISTINCT account FROM transactions) acc;
+        """)
+
+        cursor.execute("DROP VIEW IF EXISTS v_external_capital_flows;")
+        cursor.execute("""
+            CREATE VIEW v_external_capital_flows AS
+            SELECT 
+                date,
+                account,
+                transaction_type,
+                total AS flow_amount
+            FROM transactions
+            WHERE transaction_type IN ('Insättning', 'Autogiroinsättning', 'Uttag', 'Intern överföring')
+            UNION ALL
+            SELECT 
+                date,
+                account,
+                transaction_type,
+                amount * price AS flow_amount
+            FROM transactions
+            WHERE transaction_type = 'Tillgångsinsättning';
+        """)
+
         self.conn.commit()
 
         # Return a list of tables in the database

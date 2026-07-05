@@ -781,23 +781,12 @@ def portfolio(args):
             s_val = start_vals[account]['total']
             e_val = end_vals[account]['total']
             
-            # Query cash flows
+            # Query net deposits using external capital flows SQL view
             cur.execute("""
-                SELECT COALESCE(SUM(total), 0) FROM transactions
+                SELECT COALESCE(SUM(flow_amount), 0) FROM v_external_capital_flows
                 WHERE account = ? AND date > ? AND date <= ?
-                AND transaction_type IN ('Insättning', 'Autogiroinsättning', 'Uttag', 'Intern överföring')
             """, (account, start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date, end_date.isoformat() if hasattr(end_date, 'isoformat') else end_date))
-            cash_flow = cur.fetchone()[0]
-            
-            # Query asset flows
-            cur.execute("""
-                SELECT COALESCE(SUM(amount * price), 0) FROM transactions
-                WHERE account = ? AND date > ? AND date <= ?
-                AND transaction_type = 'Tillgångsinsättning'
-            """, (account, start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date, end_date.isoformat() if hasattr(end_date, 'isoformat') else end_date))
-            asset_flow = cur.fetchone()[0]
-            
-            net_dep = cash_flow + asset_flow
+            net_dep = cur.fetchone()[0]
             ret_sek = e_val - s_val - net_dep
             ret_pct = (ret_sek / s_val * 100) if s_val > 0 else 0.0
             total_change = e_val - s_val
