@@ -26,7 +26,7 @@ def get_db(args):
     return db
 
 
-def prices_are_fresh(db, max_age_days=1):
+def prices_are_fresh(db, max_age_days=1, update_all=False):
     """
     Check if prices are fresh (updated within max_age_days).
     
@@ -35,9 +35,10 @@ def prices_are_fresh(db, max_age_days=1):
     str: Oldest price date or None if no prices
     """
     cur = db.get_cursor()
-    # Get oldest price date for assets with amount > 0
+    # Get oldest price date depending on whether we check all or only held assets
+    condition = "" if update_all else "WHERE amount > 0"
     result = cur.execute(
-        "SELECT MIN(latest_price_date) FROM assets WHERE amount > 0"
+        f"SELECT MIN(latest_price_date) FROM assets {condition}"
     ).fetchone()
     
     if not result or not result[0]:
@@ -49,17 +50,19 @@ def prices_are_fresh(db, max_age_days=1):
     is_fresh = oldest_price_date >= today - timedelta(days=max_age_days)
     return is_fresh, oldest_price_date
 
-def any_assets_need_prices(db):
+def any_assets_need_prices(db, update_all=False):
     """
-    Check if any assets with amount > 0 have no price date.
+    Check if any assets have no price date.
     
     Returns:
     bool: True if any assets need prices, False otherwise
     """
     cur = db.get_cursor()
-    result = cur.execute(
-        "SELECT COUNT(*) FROM assets WHERE amount > 0 AND latest_price_date IS NULL"
-    ).fetchone()
+    if update_all:
+        query = "SELECT COUNT(*) FROM assets WHERE latest_price_date IS NULL"
+    else:
+        query = "SELECT COUNT(*) FROM assets WHERE amount > 0 AND latest_price_date IS NULL"
+    result = cur.execute(query).fetchone()
     
     return result and result[0] > 0 if result else False
 
@@ -228,14 +231,15 @@ def stats(args):
     has_date_filters = (as_of is not None or start_date is not None or end_date is not None)
 
     # Update prices if needed (only if not running past historical query or if force)
+    update_all = getattr(args, 'update_all', False)
     if args.update_prices == 'always':
         # Force price update
-        fresh, oldest_date = prices_are_fresh(db)
+        fresh, oldest_date = prices_are_fresh(db, update_all=update_all)
         if fresh:
             logging.info(f"Prices are already fresh (oldest: {oldest_date}), updating anyway...")
         try:
             stat_calc = StatCalculator(db)
-            stat_calc.update_prices(force=True)
+            stat_calc.update_prices(force=True, update_all=update_all)
             
             # Update metadata
             now = datetime.now().isoformat()
@@ -250,8 +254,8 @@ def stats(args):
             return 1
             
     elif args.update_prices == 'auto' and not has_date_filters:
-        fresh, oldest_date = prices_are_fresh(db)
-        need_prices = any_assets_need_prices(db)
+        fresh, oldest_date = prices_are_fresh(db, update_all=update_all)
+        need_prices = any_assets_need_prices(db, update_all=update_all)
         
         if not fresh or need_prices:
             if need_prices:
@@ -261,7 +265,7 @@ def stats(args):
             
             try:
                 stat_calc = StatCalculator(db)
-                stat_calc.update_prices(force=True)
+                stat_calc.update_prices(force=True, update_all=update_all)
                 
                 # Update metadata
                 now = datetime.now().isoformat()
@@ -553,14 +557,15 @@ def accounts_summary(args):
         accounts = [acc.strip() for acc in account_arg.split(',')]
     
     # Update prices if needed (same logic as stats)
+    update_all = getattr(args, 'update_all', False)
     if args.update_prices == 'always':
         # Force price update
-        fresh, oldest_date = prices_are_fresh(db)
+        fresh, oldest_date = prices_are_fresh(db, update_all=update_all)
         if fresh:
             logging.info(f"Prices are already fresh (oldest: {oldest_date}), updating anyway...")
         try:
             stat_calc = StatCalculator(db)
-            stat_calc.update_prices(force=True)
+            stat_calc.update_prices(force=True, update_all=update_all)
             
             # Update metadata
             now = datetime.now().isoformat()
@@ -572,8 +577,8 @@ def accounts_summary(args):
             return 1
             
     elif args.update_prices == 'auto':
-        fresh, oldest_date = prices_are_fresh(db)
-        need_prices = any_assets_need_prices(db)
+        fresh, oldest_date = prices_are_fresh(db, update_all=update_all)
+        need_prices = any_assets_need_prices(db, update_all=update_all)
         
         if not fresh or need_prices:
             if need_prices:
@@ -583,7 +588,7 @@ def accounts_summary(args):
             
             try:
                 stat_calc = StatCalculator(db)
-                stat_calc.update_prices(force=True)
+                stat_calc.update_prices(force=True, update_all=update_all)
                 
                 # Update metadata
                 now = datetime.now().isoformat()
@@ -661,6 +666,11 @@ Examples:
         help='When to update prices (default: auto)'
     )
     stats_parser.add_argument(
+        '--update-all',
+        action='store_true',
+        help='Update all assets in database regardless of whether they are currently held'
+    )
+    stats_parser.add_argument(
         '--force',
         action='store_true',
         help='Force statistics recalculation'
@@ -727,6 +737,11 @@ Examples:
         choices=['auto', 'always', 'never'],
         default='auto',
         help='When to update prices (default: auto)'
+    )
+    accounts_parser.add_argument(
+        '--update-all',
+        action='store_true',
+        help='Update all assets in database regardless of whether they are currently held'
     )
     accounts_parser.set_defaults(func=accounts_summary)
     

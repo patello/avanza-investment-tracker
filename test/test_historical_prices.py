@@ -501,8 +501,48 @@ def test_stats_date_range_filtering(tmp_path):
     assert len(acc_filtered) == 2
     assert acc_filtered[0][0] == date(2022, 1, 31)
     assert acc_filtered[1][0] == date(2022, 12, 31)
+    db.disconnect()
+
+
+@patch("requests.post")
+def test_update_prices_only_held_by_default(mock_post, tmp_path):
+    db_file = tmp_path / "test_held_assets.db"
+    db = DatabaseHandler(str(db_file))
+    db.connect()
+    db.create_tables()
+    
+    cur = db.get_cursor()
+    # Insert assets: A (held, amount = 10), B (not held, amount = 0)
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Asset Held', 10.0)")
+    cur.execute("INSERT INTO assets (asset, amount) VALUES ('Asset Unheld', 0.0)")
+    db.commit()
+    
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"hits": []}
+    mock_post.return_value = resp
+    
+    stat_calc = StatCalculator(db)
+    
+    # By default, update_prices should only request 'Asset Held'
+    stat_calc.update_prices(force=True)
+    
+    # Check calls to mock_post
+    called_queries = [call.kwargs['json']['query'] for call in mock_post.call_args_list]
+    assert "Asset Held" in called_queries
+    assert "Asset Unheld" not in called_queries
+    
+    # Clear mock
+    mock_post.reset_mock()
+    
+    # With update_all=True, it should request both
+    stat_calc.update_prices(force=True, update_all=True)
+    called_queries = [call.kwargs['json']['query'] for call in mock_post.call_args_list]
+    assert "Asset Held" in called_queries
+    assert "Asset Unheld" in called_queries
     
     db.disconnect()
+
 
 
 

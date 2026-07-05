@@ -1197,33 +1197,39 @@ class StatCalculator:
                     display_name = get_display_name(account)
                     print(f"  {display_name}: {percentage:.1f}%")
 
-    def update_prices(self, force: bool = False):
+    def update_prices(self, force: bool = False, update_all: bool = False):
         """
         Update prices in database. Prices are fetched from external site. 
         Prices are only updated if they are older than 1 day, unless force is True.
 
         Parameters:
         force (bool): If True, update prices even if they are already up to date.
+        update_all (bool): If True, update all assets regardless of whether they are currently held.
         """
         self.db.connect()
         cur = self.db.get_cursor()
 
         today = datetime.today().date()
 
+        # Build condition depending on whether we update all assets or only held ones
+        condition = "" if update_all else "WHERE amount > 0"
+
         if not force:
-            # Check if prices are already up to date for all assets
-            # First check: any assets missing prices?
-            result = cur.execute(
-                "SELECT COUNT(*) FROM assets WHERE latest_price_date IS NULL"
-            ).fetchone()
+            # Check if prices are already up to date for target assets
+            missing_query = f"SELECT COUNT(*) FROM assets {condition}"
+            if condition:
+                missing_query += " AND latest_price_date IS NULL"
+            else:
+                missing_query += " WHERE latest_price_date IS NULL"
+                
+            result = cur.execute(missing_query).fetchone()
             
             if result and result[0] > 0:
                 logging.debug(f"Price update needed: {result[0]} assets missing prices")
             else:
-                # Second check: get oldest price date for all assets
-                (latest_price_date_str,) = cur.execute("SELECT MIN(latest_price_date) FROM assets").fetchone()
-                # Even with detect_types=sqlite3.PARSE_DECLTYPES, the MIN function returns a string instead of a date object
-                # Therefore, we need to convert the string to a date object, if it exists
+                # Second check: get oldest price date for target assets
+                oldest_query = f"SELECT MIN(latest_price_date) FROM assets {condition}"
+                (latest_price_date_str,) = cur.execute(oldest_query).fetchone()
                 if latest_price_date_str is not None:
                     latest_price_date = datetime.strptime(latest_price_date_str, '%Y-%m-%d').date()
                 else:
@@ -1235,7 +1241,8 @@ class StatCalculator:
                     return
         
 
-        assets = cur.execute("SELECT asset,asset_id FROM assets").fetchall()
+        assets_query = f"SELECT asset,asset_id FROM assets {condition}"
+        assets = cur.execute(assets_query).fetchall()
         
         # Current working endpoint (discovered 2026-02-27)
         url = "https://www.avanza.se/_api/search/filtered-search"
