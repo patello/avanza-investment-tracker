@@ -160,6 +160,12 @@ python cli.py accounts --update-prices auto
 
 # Filter accounts (same syntax as stats command)
 python cli.py accounts --account default
+
+# View portfolio snapshot for specific accounts
+python cli.py portfolio --account "account1,savings_account"
+
+# Compare portfolio values for a specific account over a period
+python cli.py portfolio --account "account1" --start-date 2026-06-29 --end-date 2026-07-06
 ```
 
 Output format for `accounts` command:

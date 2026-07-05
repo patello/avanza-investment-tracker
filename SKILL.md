@@ -61,6 +61,10 @@ All commands accept:
 - `--database PATH` (default: `data/asset_data.db`)
 - `--special-cases PATH` (default: `data/special_cases.json`)
 
+The `portfolio` command also accepts:
+- `--account ACCOUNTS` (default: `all`, supports comma-separated list of account IDs, `default` to use default settings, or `all` for all accounts)
+- `--format FORMAT` (default: `table`, choices: `table`, `json`)
+
 ## Skill Contents
 
 ```
