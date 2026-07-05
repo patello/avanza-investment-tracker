@@ -829,7 +829,7 @@ def portfolio(args):
             total_change_sek = total_end - total_start
             
             name_width = max(max(len(c['display_name']) for c in comparison), 7)
-            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Net Deposits':>14} {'Return (SEK)':>14} {'Return (%)':>12} {'Total Change':>14}"
+            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Net Deposits':>14} {'Return':>14} {'Return (%)':>12} {'Total Change':>14}"
             print(header)
             print("-" * len(header))
             
