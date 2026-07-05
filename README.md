@@ -242,7 +242,10 @@ The unified CLI provides all functionality in a streamlined interface:
 4. (Optional) Set default accounts for filtering: `python cli.py settings default-accounts "account1,savings_account"`
 5. (Optional) Set account nicknames: `python cli.py settings account-nickname 1234567 "Savings"`
 6. View account summaries: `python cli.py accounts --update-prices auto`
-7. Check system status: `python cli.py status`
+7. View portfolio snapshot or compare change over a period:
+    - Snapshot: `python cli.py portfolio [--as-of YYYY-MM-DD]`
+    - Period comparison: `python cli.py portfolio --start-date YYYY-MM-DD [--end-date YYYY-MM-DD]`
+8. Check system status: `python cli.py status`
 
 **Advanced usage with account filtering:**
 ```bash
@@ -257,6 +260,12 @@ python cli.py stats --account "account1,savings_account" --accumulated --update-
 python cli.py accounts --account "account1"
 python cli.py accounts --account "savings_account"
 python cli.py accounts --account all
+
+# Show portfolio snapshot as of a previous date
+python cli.py portfolio --as-of 2026-07-06
+
+# Compare portfolio values between two dates
+python cli.py portfolio --start-date 2026-06-29 --end-date 2026-07-06
 ```
 
 ## Contributing

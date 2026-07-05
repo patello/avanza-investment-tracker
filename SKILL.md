@@ -52,6 +52,8 @@ The skill provides logic. Your data stays private and portable.
 | `python scripts/cli.py stats --as-of DATE` | Show performance statistics as of a previous date (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`) |
 | `python scripts/cli.py stats --start-date DATE --end-date DATE` | Filter statistics and accumulated timelines by date range |
 | `python scripts/cli.py accounts` | Show account summaries |
+| `python scripts/cli.py portfolio [--as-of DATE]` | Show portfolio snapshot (cash and assets) |
+| `python scripts/cli.py portfolio --start-date DATE [--end-date DATE]` | Show portfolio change over a period |
 | `python scripts/cli.py status` | Check system status (database stats, prices, and date range) |
 | `python scripts/cli.py reset --confirm` | Clear database (DESTRUCTIVE) |
 

@@ -610,6 +610,205 @@ def accounts_summary(args):
         return 1
 
 
+def portfolio(args):
+    """Show portfolio snapshot or change over a period."""
+    db = get_db(args)
+    cur = db.get_cursor()
+    
+    # Parse dates
+    as_of = None
+    start_date = None
+    end_date = None
+    
+    try:
+        as_of = parse_date_bound(getattr(args, 'as_of', None), is_start_bound=False)
+        start_date = parse_date_bound(getattr(args, 'start_date', None), is_start_bound=True)
+        end_date = parse_date_bound(getattr(args, 'end_date', None), is_start_bound=False)
+        
+        if as_of is not None and end_date is None:
+            end_date = as_of
+    except ValueError as e:
+        logging.error(str(e))
+        return 1
+            
+    # Parse account filter
+    account_arg = args.account.strip()
+    accounts = None
+    if account_arg.lower() == 'all':
+        accounts = None
+    elif account_arg.lower() == 'default':
+        default_accounts_str = db.get_metadata('default_accounts')
+        if default_accounts_str:
+            accounts = [acc.strip() for acc in default_accounts_str.split(',')]
+    else:
+        accounts = [acc.strip() for acc in account_arg.split(',')]
+        
+    # Get all distinct accounts from transactions up to end_date (or all time if end_date is None)
+    if accounts is None:
+        query = "SELECT DISTINCT account FROM transactions"
+        params = []
+        if end_date:
+            query += " WHERE date <= ?"
+            params.append(end_date)
+        query += " ORDER BY account"
+        accounts = [row[0] for row in cur.execute(query, params).fetchall()]
+        
+    nicknames = db.get_all_account_nicknames()
+    
+    def get_display_name(account):
+        return nicknames.get(account, account)
+        
+    def get_snapshot(as_of_date):
+        summaries = {}
+        for account in accounts:
+            # 1. Cash balance
+            cash_query = "SELECT SUM(total) FROM transactions WHERE account = ?"
+            cash_params = [account]
+            if as_of_date:
+                cash_query += " AND date <= ?"
+                cash_params.append(as_of_date)
+                
+            cur.execute(cash_query, cash_params)
+            cash_row = cur.fetchone()
+            cash = cash_row[0] if cash_row and cash_row[0] is not None else 0.0
+            
+            # 2. Asset holdings
+            holdings_query = """
+                SELECT asset_name, SUM(amount)
+                FROM transactions
+                WHERE account = ? AND transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+            """
+            holdings_params = [account]
+            if as_of_date:
+                holdings_query += " AND date <= ?"
+                holdings_params.append(as_of_date)
+            holdings_query += " GROUP BY asset_name HAVING ABS(SUM(amount)) > 0.0001"
+            
+            cur.execute(holdings_query, holdings_params)
+            holdings = cur.fetchall()
+            
+            assets_value = 0.0
+            for asset_name, amt in holdings:
+                if as_of_date:
+                    price_query = """
+                        SELECT ap.price FROM asset_prices ap
+                        JOIN assets a ON ap.asset_id = a.asset_id
+                        WHERE a.asset = ? AND ap.price_date <= ?
+                        ORDER BY ap.price_date DESC LIMIT 1
+                    """
+                    cur.execute(price_query, (asset_name, as_of_date))
+                    p_row = cur.fetchone()
+                    if p_row:
+                        price = p_row[0]
+                    else:
+                        cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                        fallback_row = cur.fetchone()
+                        price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
+                else:
+                    cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                    p_row = cur.fetchone()
+                    price = p_row[0] if p_row and p_row[0] is not None else 0.0
+                    
+                assets_value += amt * price
+                
+            summaries[account] = {
+                'cash': cash,
+                'assets': assets_value,
+                'total': cash + assets_value
+            }
+        return summaries
+
+    if start_date is not None:
+        # Comparison mode: show change from start_date to end_date
+        start_vals = get_snapshot(start_date)
+        end_vals = get_snapshot(end_date)
+        
+        comparison = []
+        for account in accounts:
+            s_val = start_vals[account]['total']
+            e_val = end_vals[account]['total']
+            change = e_val - s_val
+            pct = (change / s_val * 100) if s_val > 0 else 0.0
+            comparison.append({
+                'account': account,
+                'display_name': get_display_name(account),
+                'start_value': s_val,
+                'end_value': e_val,
+                'change': change,
+                'percent_change': pct
+            })
+            
+        if args.format == 'json':
+            import json
+            print(json.dumps(comparison, indent=2))
+        else:
+            if not comparison:
+                print("No portfolio data found")
+                return 0
+                
+            total_start = sum(c['start_value'] for c in comparison)
+            total_end = sum(c['end_value'] for c in comparison)
+            total_change = total_end - total_start
+            total_pct = (total_change / total_start * 100) if total_start > 0 else 0.0
+            
+            name_width = max(max(len(c['display_name']) for c in comparison), 7)
+            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Change (SEK)':>14} {'Change (%)':>12}"
+            print(header)
+            print("-" * len(header))
+            
+            for c in comparison:
+                change_sign = "+" if c['change'] > 0 else ""
+                pct_sign = "+" if c['percent_change'] > 0 else ""
+                change_str = f"{change_sign}{c['change']:,.0f}"
+                pct_str = f"{pct_sign}{c['percent_change']:.1f}%"
+                print(f"{c['display_name']:<{name_width}} {c['start_value']:>12.0f} {c['end_value']:>12.0f} {change_str:>14} {pct_str:>12}")
+                
+            print("-" * len(header))
+            total_change_sign = "+" if total_change > 0 else ""
+            total_pct_sign = "+" if total_pct > 0 else ""
+            total_change_str = f"{total_change_sign}{total_change:,.0f}"
+            total_pct_str = f"{total_pct_sign}{total_pct:.1f}%"
+            print(f"{'TOTAL':<{name_width}} {total_start:>12.0f} {total_end:>12.0f} {total_change_str:>14} {total_pct_str:>12}")
+            
+    else:
+        # Single snapshot mode
+        vals = get_snapshot(end_date)
+        summaries = []
+        for account in accounts:
+            summaries.append({
+                'account': account,
+                'display_name': get_display_name(account),
+                'cash': vals[account]['cash'],
+                'assets': vals[account]['assets'],
+                'total': vals[account]['total']
+            })
+            
+        if args.format == 'json':
+            import json
+            print(json.dumps(summaries, indent=2))
+        else:
+            if not summaries:
+                print("No portfolio data found")
+                return 0
+                
+            total_cash = sum(s['cash'] for s in summaries)
+            total_assets = sum(s['assets'] for s in summaries)
+            total_total = sum(s['total'] for s in summaries)
+            
+            name_width = max(max(len(s['display_name']) for s in summaries), 7)
+            header = f"{'Account':<{name_width}} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12}"
+            print(header)
+            print("-" * len(header))
+            
+            for s in summaries:
+                print(f"{s['display_name']:<{name_width}} {s['cash']:>12.0f} {s['assets']:>12.0f} {s['total']:>12.0f}")
+                
+            print("-" * len(header))
+            print(f"{'TOTAL':<{name_width}} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f}")
+            
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Avanza investment tracker CLI",
@@ -744,6 +943,36 @@ Examples:
         help='Update all assets in database regardless of whether they are currently held'
     )
     accounts_parser.set_defaults(func=accounts_summary)
+    
+    # Portfolio command (show portfolio snapshot)
+    portfolio_parser = subparsers.add_parser('portfolio', help='Show portfolio snapshot')
+    portfolio_parser.add_argument(
+        '--as-of',
+        default=None,
+        help='Valuation date (YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--start-date',
+        default=None,
+        help='Start date for period comparison (YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--end-date',
+        default=None,
+        help='End date for period comparison (YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--account',
+        default='all',
+        help='Accounts to include: "default", "all", or comma-separated list of accounts'
+    )
+    portfolio_parser.add_argument(
+        '--format',
+        choices=['table', 'json'],
+        default='table',
+        help='Output format (default: table)'
+    )
+    portfolio_parser.set_defaults(func=portfolio)
     
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
