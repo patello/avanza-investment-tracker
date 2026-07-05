@@ -379,10 +379,48 @@ def stats(args):
         if accounts is not None:
             kwargs['accounts'] = accounts
         
-        if args.accumulated:
-            stat_calc.print_accumulated(**kwargs)
+        if getattr(args, 'format', 'table') == 'json':
+            import json
+            def serialize_date(d):
+                if hasattr(d, 'isoformat'):
+                    return d.isoformat()
+                return str(d)
+                
+            if args.accumulated:
+                acc_stats = stat_calc.get_accumulated(**kwargs)
+                json_data = []
+                for (date_val, acc_net_deposit, acc_value, acc_gainloss) in acc_stats:
+                    json_data.append({
+                        'date': serialize_date(date_val),
+                        'deposit': acc_net_deposit,
+                        'value': acc_value,
+                        'gain_loss': acc_gainloss
+                    })
+                print(json.dumps(json_data, indent=2))
+            else:
+                stats_list = stat_calc.get_stats(**kwargs)
+                json_data = []
+                for (date_val, deposit, withdrawal, value, total_gainloss, realized_gainloss, unrealized_gainloss, total_gainloss_per, realized_gainloss_per, unrealized_gainloss_per, annual_per_yield) in stats_list:
+                    if deposit > 0:
+                        json_data.append({
+                            'date': serialize_date(date_val),
+                            'deposit': deposit,
+                            'withdrawal': withdrawal,
+                            'value': value,
+                            'total_gainloss': total_gainloss,
+                            'total_gainloss_percent': total_gainloss_per,
+                            'realized_gainloss': realized_gainloss,
+                            'realized_gainloss_percent': realized_gainloss_per,
+                            'unrealized_gainloss': unrealized_gainloss,
+                            'unrealized_gainloss_percent': unrealized_gainloss_per,
+                            'apy': annual_per_yield
+                        })
+                print(json.dumps(json_data, indent=2))
         else:
-            stat_calc.print_stats(**kwargs)
+            if args.accumulated:
+                stat_calc.print_accumulated(**kwargs)
+            else:
+                stat_calc.print_stats(**kwargs)
         return 0
         
     except Exception as e:
@@ -602,7 +640,22 @@ def accounts_summary(args):
     # Display account summary
     try:
         stat_calc = StatCalculator(db)
-        stat_calc.print_account_summary(accounts=accounts)
+        if getattr(args, 'format', 'table') == 'json':
+            summaries = stat_calc.get_account_summaries(accounts)
+            nicknames = db.get_all_account_nicknames()
+            json_data = []
+            for account, cash, asset_value, total in summaries:
+                json_data.append({
+                    'account': account,
+                    'display_name': nicknames.get(account, account),
+                    'cash': cash,
+                    'assets': asset_value,
+                    'total': total
+                })
+            import json
+            print(json.dumps(json_data, indent=2))
+        else:
+            stat_calc.print_account_summary(accounts=accounts)
         return 0
         
     except Exception as e:
@@ -900,6 +953,12 @@ Examples:
         default=None,
         help='End date for filtering statistics (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
+    stats_parser.add_argument(
+        '--format',
+        choices=['table', 'json'],
+        default='table',
+        help='Output format (default: table)'
+    )
     stats_parser.set_defaults(func=stats)
     
     # Settings command
@@ -941,6 +1000,12 @@ Examples:
         '--update-all',
         action='store_true',
         help='Update all assets in database regardless of whether they are currently held'
+    )
+    accounts_parser.add_argument(
+        '--format',
+        choices=['table', 'json'],
+        default='table',
+        help='Output format (default: table)'
     )
     accounts_parser.set_defaults(func=accounts_summary)
     

@@ -253,6 +253,8 @@ The unified CLI provides all functionality in a streamlined interface:
     - Period comparison: `python cli.py portfolio --start-date YYYY-MM-DD [--end-date YYYY-MM-DD]`
 8. Check system status: `python cli.py status`
 
+Note: All valuation commands (`stats`, `accounts`, `portfolio`) accept a `--format json` flag to return data in machine-readable JSON format instead of a plain-text table/block.
+
 **Advanced usage with account filtering:**
 ```bash
 # Show stats for specific accounts
