@@ -47,7 +47,10 @@ The skill provides logic. Your data stays private and portable.
 |---------|-------------|
 | `python scripts/cli.py import FILE` | Import transactions from CSV |
 | `python scripts/cli.py stats` | Show performance stats |
-| `python scripts/cli.py stats --update-prices auto` | Update prices, then show stats |
+| `python scripts/cli.py stats --update-prices auto` | Update prices, then show stats (default: only held assets) |
+| `python scripts/cli.py stats --update-all` | Update prices for all assets in the database, held or not |
+| `python scripts/cli.py stats --as-of DATE` | Show performance statistics as of a previous date (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`) |
+| `python scripts/cli.py stats --start-date DATE --end-date DATE` | Filter statistics and accumulated timelines by date range |
 | `python scripts/cli.py accounts` | Show account summaries |
 | `python scripts/cli.py status` | Check system status (database stats, prices, and date range) |
 | `python scripts/cli.py reset --confirm` | Clear database (DESTRUCTIVE) |
