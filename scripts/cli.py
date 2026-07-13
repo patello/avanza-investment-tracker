@@ -280,9 +280,11 @@ def stats(args):
                 return 1
     
     # Calculate stats if needed
-    apy_mode = getattr(args, 'apy_mode', 'modified-dietz')
+    apy_mode = getattr(args, 'apy_mode', 'mwrr')
     # Force recalculation if APY mode changed
-    last_apy_mode = db.get_metadata('last_apy_mode') or 'modified-dietz'
+    last_apy_mode = db.get_metadata('last_apy_mode') or 'mwrr'
+    if last_apy_mode == 'modified-dietz':
+        last_apy_mode = 'mwrr'
     apy_mode_changed = (apy_mode != last_apy_mode)
     if not has_date_filters and (args.force or apy_mode_changed or stats_need_recalculation(db)):
         try:
@@ -846,43 +848,177 @@ def portfolio(args):
             total_pct_str = f"{total_pct_sign}{total_return_pct:.1f}%"
             total_chg_str = f"{total_chg_sign}{total_change_sek:,.0f}"
             
-            print(f"{'TOTAL':<{name_width}} {total_start:>12.0f} {total_end:>12.0f} {total_dep_str:>14} {total_ret_str:>14} {total_pct_str:>12} {total_chg_str:>14}")
-            
     else:
         # Single snapshot mode
         vals = get_snapshot(end_date)
-        summaries = []
-        for account in accounts:
-            summaries.append({
-                'account': account,
-                'display_name': get_display_name(account),
-                'cash': vals[account]['cash'],
-                'assets': vals[account]['assets'],
-                'total': vals[account]['total']
-            })
+        
+        # Calculate APY mode
+        apy_mode = getattr(args, 'apy_mode', 'mwrr')
+        mode_label = 'MWRR' if apy_mode == 'mwrr' else 'TWRR'
+        
+        # If we have a single account, show the detailed summary layout
+        if len(accounts) == 1:
+            account = accounts[0]
+            nickname = nicknames.get(account, account)
             
-        if args.format == 'json':
-            import json
-            print(json.dumps(summaries, indent=2))
+            # Fetch cash flows totals
+            cur.execute("""
+                SELECT 
+                    COALESCE(SUM(CASE WHEN flow_amount > 0 THEN flow_amount ELSE 0 END), 0) AS deposits,
+                    COALESCE(SUM(CASE WHEN flow_amount < 0 THEN flow_amount ELSE 0 END), 0) AS withdrawals
+                FROM v_external_capital_flows
+                WHERE account = ?
+            """, (account,))
+            cf_row = cur.fetchone()
+            deposits = cf_row[0] if cf_row else 0.0
+            withdrawals = cf_row[1] if cf_row else 0.0
+            net_invested = deposits + withdrawals # withdrawals is negative
+            
+            # Current value (cash + assets)
+            cash = vals[account]['cash']
+            assets = vals[account]['assets']
+            current_value = cash + assets
+            
+            # Fetch gain/loss from account_cohort_stats
+            cur.execute("""
+                SELECT acc_total_gainloss FROM account_cohort_stats
+                WHERE account = ?
+                ORDER BY month DESC LIMIT 1
+            """, (account,))
+            gl_row = cur.fetchone()
+            total_gainloss = gl_row[0] if gl_row and gl_row[0] is not None else (current_value - net_invested)
+            
+            gainloss_pct = (total_gainloss / deposits * 100) if deposits > 0 else 0.0
+            
+            # Calculate APY
+            stat_calc = StatCalculator(db)
+            apy, total_days = stat_calc.calculate_account_apy(account, apy_mode=apy_mode, end_date=end_date, current_value=current_value)
+            
+            if args.format == 'json':
+                import json
+                result = {
+                    'account': account,
+                    'display_name': nickname,
+                    'deposits': deposits,
+                    'withdrawals': abs(withdrawals),
+                    'net_invested': net_invested,
+                    'current_value': current_value,
+                    'total_gain': total_gainloss,
+                    'total_gain_percent': gainloss_pct,
+                    'apy': apy,
+                    'apy_mode': apy_mode
+                }
+                print(json.dumps(result, indent=2))
+            else:
+                # Print human-readable summary
+                print(f"Account {account} ({nickname})")
+                print(f"Deposits: {deposits:,.0f} SEK")
+                print(f"Withdrawals: {abs(withdrawals):,.0f} SEK")
+                print(f"Net invested: {net_invested:,.0f} SEK")
+                print(f"Current value: {current_value:,.0f} SEK")
+                
+                # Sign formatting
+                gl_sign = "+" if total_gainloss > 0 else ""
+                gl_pct_sign = "+" if gainloss_pct > 0 else ""
+                print(f"Total gain: {gl_sign}{total_gainloss:,.0f} SEK ({gl_pct_sign}{gainloss_pct:.1f}%)")
+                if apy is not None:
+                    print(f"APY: {apy:.1f}% ({mode_label})")
+                else:
+                    print("APY: N/A")
+                    
         else:
-            if not summaries:
-                print("No portfolio data found")
-                return 0
-                
-            total_cash = sum(s['cash'] for s in summaries)
-            total_assets = sum(s['assets'] for s in summaries)
-            total_total = sum(s['total'] for s in summaries)
+            # Multi-account table view
+            summaries = []
+            stat_calc = StatCalculator(db)
             
-            name_width = max(max(len(s['display_name']) for s in summaries), 7)
-            header = f"{'Account':<{name_width}} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12}"
-            print(header)
-            print("-" * len(header))
-            
-            for s in summaries:
-                print(f"{s['display_name']:<{name_width}} {s['cash']:>12.0f} {s['assets']:>12.0f} {s['total']:>12.0f}")
+            for account in accounts:
+                nickname = nicknames.get(account, account)
+                cash = vals[account]['cash']
+                assets = vals[account]['assets']
+                current_value = cash + assets
                 
-            print("-" * len(header))
-            print(f"{'TOTAL':<{name_width}} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f}")
+                # Fetch deposits/withdrawals
+                cur.execute("""
+                    SELECT 
+                        COALESCE(SUM(CASE WHEN flow_amount > 0 THEN flow_amount ELSE 0 END), 0) AS deposits,
+                        COALESCE(SUM(CASE WHEN flow_amount < 0 THEN flow_amount ELSE 0 END), 0) AS withdrawals
+                    FROM v_external_capital_flows
+                    WHERE account = ?
+                """, (account,))
+                cf_row = cur.fetchone()
+                deposits = cf_row[0] if cf_row else 0.0
+                withdrawals = cf_row[1] if cf_row else 0.0
+                net_invested = deposits + withdrawals
+                
+                cur.execute("""
+                    SELECT acc_total_gainloss FROM account_cohort_stats
+                    WHERE account = ?
+                    ORDER BY month DESC LIMIT 1
+                """, (account,))
+                gl_row = cur.fetchone()
+                total_gainloss = gl_row[0] if gl_row and gl_row[0] is not None else (current_value - net_invested)
+                
+                gainloss_pct = (total_gainloss / deposits * 100) if deposits > 0 else 0.0
+                apy, total_days = stat_calc.calculate_account_apy(account, apy_mode=apy_mode, end_date=end_date, current_value=current_value)
+                
+                summaries.append({
+                    'account': account,
+                    'display_name': nickname,
+                    'cash': cash,
+                    'assets': assets,
+                    'total': current_value,
+                    'deposits': deposits,
+                    'withdrawals': abs(withdrawals),
+                    'net_invested': net_invested,
+                    'total_gain': total_gainloss,
+                    'total_gain_percent': gainloss_pct,
+                    'apy': apy
+                })
+                
+            if args.format == 'json':
+                import json
+                print(json.dumps(summaries, indent=2))
+            else:
+                if not summaries:
+                    print("No portfolio data found")
+                    return 0
+                    
+                total_cash = sum(s['cash'] for s in summaries)
+                total_assets = sum(s['assets'] for s in summaries)
+                total_total = sum(s['total'] for s in summaries)
+                total_deposits = sum(s['deposits'] for s in summaries)
+                total_withdrawals = sum(s['withdrawals'] for s in summaries)
+                
+                # Fetch combined total gain/loss from DB
+                total_gainloss = 0.0
+                for s in summaries:
+                    total_gainloss += s['total_gain']
+                    
+                total_gain_percent = (total_gainloss / total_deposits * 100) if total_deposits > 0 else 0.0
+                
+                # Calculate combined APY
+                combined_apy, total_days = stat_calc.calculate_account_apy(accounts, apy_mode=apy_mode, end_date=end_date, current_value=total_total)
+                
+                name_width = max(max(len(s['display_name']) for s in summaries), 7)
+                
+                header = f"{'Account':<{name_width}} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12} {'Deposits':>12} {'Gain/Loss':>14} {'Gain (%)':>10} {'APY':>8}"
+                print(header)
+                print("-" * len(header))
+                
+                for s in summaries:
+                    gl_sign = "+" if s['total_gain'] > 0 else ""
+                    gl_pct_sign = "+" if s['total_gain_percent'] > 0 else ""
+                    apy_str = f"{s['apy']:.1f}%" if s['apy'] is not None else "N/A"
+                    
+                    print(f"{s['display_name']:<{name_width}} {s['cash']:>12.0f} {s['assets']:>12.0f} {s['total']:>12.0f} {s['deposits']:>12.0f} {gl_sign}{s['total_gain']:>13.0f} {gl_pct_sign}{s['total_gain_percent']:>8.1f}% {apy_str:>8}")
+                    
+                print("-" * len(header))
+                
+                total_gl_sign = "+" if total_gainloss > 0 else ""
+                total_gl_pct_sign = "+" if total_gain_percent > 0 else ""
+                total_apy_str = f"{combined_apy:.1f}%" if combined_apy is not None else "N/A"
+                
+                print(f"{'TOTAL':<{name_width}} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f} {total_deposits:>12.0f} {total_gl_sign}{total_gainloss:>13.0f} {total_gl_pct_sign}{total_gain_percent:>8.1f}% {total_apy_str:>8}")
             
     return 0
 
@@ -959,9 +1095,9 @@ Examples:
     )
     stats_parser.add_argument(
         '--apy-mode',
-        choices=['modified-dietz', 'twrr'],
-        default='modified-dietz',
-        help='APY calculation method (default: modified-dietz)'
+        choices=['mwrr', 'twrr'],
+        default='mwrr',
+        help='APY calculation method (default: mwrr)'
     )
     stats_parser.add_argument(
         '--as-of',
@@ -1055,6 +1191,12 @@ Examples:
         '--account',
         default='all',
         help='Accounts to include: "default", "all", or comma-separated list of accounts'
+    )
+    portfolio_parser.add_argument(
+        '--apy-mode',
+        choices=['mwrr', 'twrr'],
+        default='mwrr',
+        help='APY calculation method (default: mwrr)'
     )
     portfolio_parser.add_argument(
         '--format',

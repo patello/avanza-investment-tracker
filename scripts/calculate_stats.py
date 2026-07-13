@@ -177,7 +177,7 @@ class StatCalculator:
         Calculate APY using the specified mode.
         
         Parameters:
-        apy_mode (str): 'modified-dietz' or 'twrr'
+        apy_mode (str): 'mwrr' or 'twrr'
         active_base (float): TWRR active base value
         value (float): Current position value
         deposit (float): Total deposits
@@ -235,7 +235,7 @@ class StatCalculator:
         Calculate APY for merged multi-account stats.
         
         Parameters:
-        apy_mode (str): 'modified-dietz' or 'twrr'
+        apy_mode (str): 'mwrr' or 'twrr'
         accounts (list): List of account strings
         Other params: same as _calc_apy
         
@@ -345,13 +345,13 @@ class StatCalculator:
             deposit, total_gainloss, value, start_date, parsed_cfs, today)
         return self._annualize_hpr(hpr, total_days)
 
-    def calculate_cohort_stats(self, apy_mode='modified-dietz', today=None):
+    def calculate_cohort_stats(self, apy_mode='mwrr', today=None):
         """
         Calculate monthly stats such as capital transfers and gain/loss.
         Stores results in account_cohort_stats table (per account).
         
         Parameters:
-        apy_mode (str): 'modified-dietz' or 'twrr'
+        apy_mode (str): 'mwrr' or 'twrr'
         """
         self._ensure_per_account_tables()
         self.db.connect()
@@ -487,13 +487,13 @@ class StatCalculator:
         self.db.commit()
         logging.info(f"Monthly stats calculated for {len(accounts)} accounts")
             
-    def calculate_year_stats(self, apy_mode='modified-dietz', today=None):
+    def calculate_year_stats(self, apy_mode='mwrr', today=None):
         """
         Calculate yearly stats from monthly stats.
         Stores results in account_year_stats table (per account).
         
         Parameters:
-        apy_mode (str): 'modified-dietz' or 'twrr'
+        apy_mode (str): 'mwrr' or 'twrr'
         """
         self._ensure_per_account_tables()
         self.db.connect()
@@ -654,17 +654,17 @@ class StatCalculator:
         self.db.commit()
         logging.info(f"Yearly stats calculated for {len(accounts)} accounts")
         
-    def calculate_stats(self, apy_mode='modified-dietz'):
+    def calculate_stats(self, apy_mode='mwrr'):
         """
         Calculate monthly and yearly stats such as capital transfers and gain/loss.
         
         Parameters:
-        apy_mode (str): 'modified-dietz' or 'twrr'
+        apy_mode (str): 'mwrr' or 'twrr'
         """
         self.calculate_cohort_stats(apy_mode=apy_mode)
         self.calculate_year_stats(apy_mode=apy_mode)
 
-    def get_stats(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz", start_date=None, end_date=None) -> list:
+    def get_stats(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "mwrr", start_date=None, end_date=None) -> list:
         """
         Get stats such as capital transfers and gain/loss for either months or years.
         "deposits" determine if only months/years with non-withdrawn capital are returned or all months/years.
@@ -864,7 +864,7 @@ class StatCalculator:
         
         return stats
 
-    def get_accumulated(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "modified-dietz", start_date=None, end_date=None) -> list:
+    def get_accumulated(self, accounts=None, period: str = "month", deposits: str = "current", apy_mode: str = "mwrr", start_date=None, end_date=None) -> list:
         """
         Get accumulated stats such as capital transfers and gain/loss for either months or years.
         "deposits" determine if only months/years with non-withdrawn capital are returned or all months/years.
@@ -1325,6 +1325,164 @@ class StatCalculator:
             time.sleep(0.05)
 
         self.db.commit()
+
+    def calculate_account_apy(self, account, apy_mode='mwrr', end_date=None, current_value=None):
+        """
+        Calculate overall APY (Money-Weighted or Time-Weighted) for one or more accounts.
+        """
+        self.db.connect()
+        cur = self.db.get_cursor()
+        
+        if end_date is None:
+            today = datetime.today().date()
+        elif isinstance(end_date, str):
+            today = datetime.strptime(end_date, "%Y-%m-%d").date()
+        else:
+            today = end_date
+            
+        # Parse accounts list
+        if account is None or account == 'all':
+            cur.execute("SELECT DISTINCT account FROM cohort_data")
+            accounts = [row[0] for row in cur.fetchall()]
+        elif isinstance(account, str):
+            accounts = [account]
+        else:
+            accounts = list(account)
+            
+        if not accounts:
+            return None, 0
+            
+        # 1. Determine evaluation value (cash + assets)
+        if current_value is not None:
+            eval_value = current_value
+        else:
+            # Cash: sum total from transactions up to end_date
+            cash_placeholders = ",".join("?" * len(accounts))
+            cash_query = f"SELECT SUM(total) FROM transactions WHERE account IN ({cash_placeholders})"
+            cash_params = list(accounts)
+            if end_date:
+                cash_query += " AND date <= ?"
+                cash_params.append(end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date))
+            cur.execute(cash_query, cash_params)
+            cash_row = cur.fetchone()
+            cash = cash_row[0] if cash_row and cash_row[0] is not None else 0.0
+            
+            # Assets: sum cohort assets at latest price
+            assets_value = 0.0
+            for acc in accounts:
+                cur.execute("""
+                    SELECT ma.asset_id, SUM(ma.amount)
+                    FROM cohort_assets ma
+                    WHERE ma.account = ? AND ma.amount > 0.0001
+                    GROUP BY ma.asset_id
+                """, (acc,))
+                holdings = cur.fetchall()
+                for asset_id, amount in holdings:
+                    if end_date:
+                        price_query = """
+                            SELECT price FROM asset_prices
+                            WHERE asset_id = ? AND price_date <= ?
+                            ORDER BY price_date DESC LIMIT 1
+                        """
+                        cur.execute(price_query, (asset_id, end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)))
+                        p_row = cur.fetchone()
+                        if p_row:
+                            price = p_row[0]
+                        else:
+                            cur.execute("SELECT latest_price FROM assets WHERE asset_id = ?", (asset_id,))
+                            fallback_row = cur.fetchone()
+                            price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
+                    else:
+                        cur.execute("SELECT latest_price FROM assets WHERE asset_id = ?", (asset_id,))
+                        p_row = cur.fetchone()
+                        price = p_row[0] if p_row and p_row[0] is not None else 0.0
+                    assets_value += amount * price
+            eval_value = cash + assets_value
+            
+        # 2. Calculate APY based on mode
+        cash_placeholders = ",".join("?" * len(accounts))
+        if apy_mode == 'twrr':
+            # Sum active_base across all cohorts of these accounts
+            ab_query = f"SELECT SUM(active_base) FROM cohort_data WHERE account IN ({cash_placeholders})"
+            cur.execute(ab_query, list(accounts))
+            ab_row = cur.fetchone()
+            active_base = ab_row[0] if ab_row and ab_row[0] else 0.0
+            
+            # Start date: min month from cohort_data for these accounts
+            cur.execute(f"SELECT MIN(month) FROM cohort_data WHERE account IN ({cash_placeholders})", list(accounts))
+            min_month_row = cur.fetchone()
+            if not min_month_row or not min_month_row[0]:
+                return 0.0, 0
+            start_date = datetime.strptime(min_month_row[0], "%Y-%m-%d").date()
+            
+            if active_base > 1e-4 and eval_value > 0:
+                total_return = eval_value / active_base
+                total_days = (today - start_date).days
+                if total_days > 0:
+                    apy = 100 * (total_return ** (365.25 / total_days) - 1)
+                    return apy, total_days
+            
+            # Check for closed return snapshot
+            cur.execute(f"""
+                SELECT SUM(deposit * closed_return), SUM(deposit)
+                FROM cohort_data
+                WHERE account IN ({cash_placeholders}) AND closed_return IS NOT NULL
+            """, list(accounts))
+            cr_row = cur.fetchone()
+            if cr_row and cr_row[0] and cr_row[1] and cr_row[1] > 0:
+                weighted_cr = cr_row[0] / cr_row[1]
+                total_days = (today - start_date).days
+                if total_days > 0:
+                    apy = 100 * (weighted_cr ** (365.25 / total_days) - 1)
+                    return apy, total_days
+            return 0.0, 0
+            
+        else: # MWRR / Modified Dietz
+            # Query all flows
+            flows_query = f"""
+                SELECT date, flow_amount FROM v_external_capital_flows
+                WHERE account IN ({cash_placeholders})
+            """
+            flows_params = list(accounts)
+            if end_date:
+                flows_query += " AND date <= ?"
+                flows_params.append(end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date))
+            flows_query += " ORDER BY date ASC"
+            
+            cur.execute(flows_query, flows_params)
+            rows = cur.fetchall()
+            if not rows:
+                return None, 0
+                
+            cash_flows = []
+            for date_str, flow_amount in rows:
+                cf_date = datetime.strptime(date_str, "%Y-%m-%d").date() if isinstance(date_str, str) else date_str
+                cash_flows.append((cf_date, flow_amount))
+                
+            start_date = cash_flows[0][0]
+            total_days = (today - start_date).days
+            if total_days <= 0:
+                return 0.0, 0
+                
+            sum_w_cf = 0.0
+            total_cf = 0.0
+            for cf_date, cf_amount in cash_flows:
+                days_elapsed = (cf_date - start_date).days
+                days_elapsed = max(0, min(days_elapsed, total_days))
+                weight = (total_days - days_elapsed) / total_days
+                sum_w_cf += weight * cf_amount
+                total_cf += cf_amount
+                
+            total_gainloss = eval_value - total_cf
+            if sum_w_cf <= 0.001:
+                if total_cf > 0:
+                    return (total_gainloss / total_cf * 100), total_days
+                return 0.0, total_days
+                
+            hpr = total_gainloss / sum_w_cf
+            apy = self._annualize_hpr(hpr, total_days)
+            return apy, total_days
+
 
 if __name__ == "__main__":
     db = DatabaseHandler("data/asset_data.db")

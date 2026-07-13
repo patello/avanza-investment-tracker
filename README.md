@@ -201,6 +201,12 @@ python cli.py stats --period month --accumulated
 - **Carries forward**: Assets from earlier periods continue to appear
 - **Use case**: See total portfolio growth over time
 
+#### 3. APY Calculation Modes
+
+You can specify the method used to calculate APY using the `--apy-mode` argument (supported by `stats` and `portfolio` commands):
+- `--apy-mode mwrr` (default): Money-Weighted Rate of Return. This is implemented using the **Modified Dietz** method. It accounts for the timing and size of all cash flows (deposits and withdrawals) in the period.
+- `--apy-mode twrr`: Time-Weighted Rate of Return. This measures pure investment performance independent of cash flow timing.
+
 #### Example
 **January 2024:**
 - Deposit: 10,000 SEK
