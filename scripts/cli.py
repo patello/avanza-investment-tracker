@@ -788,6 +788,70 @@ def portfolio(args):
             }
         return summaries
 
+    def get_account_holdings(account, as_of_date):
+        holdings = []
+        if as_of_date is None:
+            # Query cohort_assets for current holdings
+            query = """
+                SELECT a.asset, SUM(ca.amount) AS held_amount, a.latest_price
+                FROM cohort_assets ca
+                JOIN assets a ON ca.asset_id = a.asset_id
+                WHERE ca.account = ?
+                GROUP BY a.asset
+                HAVING SUM(ca.amount) > 0.0001
+                ORDER BY (SUM(ca.amount) * COALESCE(a.latest_price, 0.0)) DESC
+            """
+            cur.execute(query, (account,))
+            rows = cur.fetchall()
+            for asset_name, amt, price in rows:
+                price_val = price if price is not None else 0.0
+                holdings.append({
+                    'asset': asset_name,
+                    'amount': amt,
+                    'price': price_val,
+                    'market_value': amt * price_val
+                })
+        else:
+            # Past holdings from transactions
+            query = """
+                SELECT asset_name, SUM(amount) AS held_amount
+                FROM transactions
+                WHERE account = ? AND transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                  AND date <= ?
+                GROUP BY asset_name
+                HAVING ABS(SUM(amount)) > 0.0001
+            """
+            cur.execute(query, (account, as_of_date.isoformat() if hasattr(as_of_date, 'isoformat') else as_of_date))
+            rows = cur.fetchall()
+            for asset_name, amt in rows:
+                # Get price as of as_of_date
+                price_query = """
+                    SELECT ap.price FROM asset_prices ap
+                    JOIN assets a ON ap.asset_id = a.asset_id
+                    WHERE a.asset = ? AND ap.price_date <= ?
+                    ORDER BY ap.price_date DESC LIMIT 1
+                """
+                cur.execute(price_query, (asset_name, as_of_date))
+                p_row = cur.fetchone()
+                if p_row:
+                    price = p_row[0]
+                else:
+                    cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                    fallback_row = cur.fetchone()
+                    price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
+                
+                holdings.append({
+                    'asset': asset_name,
+                    'amount': amt,
+                    'price': price,
+                    'market_value': amt * price
+                })
+            
+            # Sort by market value descending
+            holdings.sort(key=lambda x: x['market_value'], reverse=True)
+            
+        return holdings
+
     if start_date is not None:
         # Comparison mode: show change from start_date to end_date (pure market return)
         start_vals = get_snapshot(start_date)
@@ -909,8 +973,23 @@ def portfolio(args):
             stat_calc = StatCalculator(db)
             apy, total_days = stat_calc.calculate_account_apy(account, apy_mode=apy_mode, end_date=end_date, current_value=current_value)
             
+            # Fetch holdings scoped to this account
+            holdings = get_account_holdings(account, end_date)
+            total_assets_val = sum(h['market_value'] for h in holdings)
+            
             if args.format == 'json':
                 import json
+                holdings_json = []
+                for h in holdings:
+                    alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                    holdings_json.append({
+                        'asset': h['asset'],
+                        'amount': h['amount'],
+                        'price': h['price'],
+                        'market_value': h['market_value'],
+                        'allocation_percent': alloc
+                    })
+                
                 result = {
                     'account': account,
                     'display_name': nickname,
@@ -921,7 +1000,8 @@ def portfolio(args):
                     'total_gain': total_gainloss,
                     'total_gain_percent': gainloss_pct,
                     'apy': apy,
-                    'apy_mode': apy_mode
+                    'apy_mode': apy_mode,
+                    'holdings': holdings_json
                 }
                 print(json.dumps(result, indent=2))
             else:
@@ -940,6 +1020,23 @@ def portfolio(args):
                     print(f"APY: {apy:.1f}% ({mode_label})")
                 else:
                     print("APY: N/A")
+                
+                if holdings:
+                    print()
+                    print("  Holdings:")
+                    name_w = max(max(len(h['asset']) for h in holdings), 9)
+                    print(f"    {'Fund Name':<{name_w}} {'Market Value':>15} {'Allocation':>11}")
+                    for h in holdings:
+                        alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                        val_str = f"{h['market_value']:,.0f} SEK"
+                        alloc_str = f"{alloc:.1f}%"
+                        print(f"    {h['asset']:<{name_w}} {val_str:>15} {alloc_str:>11}")
+                    
+                    total_val_str = f"{total_assets_val:,.0f} SEK"
+                    print(f"  {'Total':<{name_w + 2}} {total_val_str:>15} {'100.0%':>11}")
+                else:
+                    print()
+                    print("  Holdings: None")
                     
         else:
             # Multi-account table view

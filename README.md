@@ -181,6 +181,56 @@ savings_account             50000            0        50000
 TOTAL                       50000       100000       150000
 ```
 
+Output format for `portfolio` command (single account):
+```
+Account account1 (Account Nickname)
+Deposits: 100,000 SEK
+Withdrawals: 0 SEK
+Net invested: 100,000 SEK
+Current value: 105,000 SEK
+Total gain: +5,000 SEK (+5.0%)
+APY: 10.2% (MWRR)
+
+  Holdings:
+    Fund Name              Market Value    Allocation
+    Asset A                 80,000 SEK         76.2%
+    Asset B                 25,000 SEK         23.8%
+  Total                    105,000 SEK        100.0%
+```
+
+With `--format json`, the single-account output includes a `holdings` list:
+```json
+{
+  "account": "account1",
+  "display_name": "Account Nickname",
+  "deposits": 100000.0,
+  "withdrawals": 0.0,
+  "net_invested": 100000.0,
+  "current_value": 105000.0,
+  "total_gain": 5000.0,
+  "total_gain_percent": 5.0,
+  "apy": 10.2,
+  "apy_mode": "mwrr",
+  "holdings": [
+    {
+      "asset": "Asset A",
+      "amount": 80.0,
+      "price": 1000.0,
+      "market_value": 80000.0,
+      "allocation_percent": 76.19
+    },
+    {
+      "asset": "Asset B",
+      "amount": 25.0,
+      "price": 1000.0,
+      "market_value": 25000.0,
+      "allocation_percent": 23.81
+    }
+  ]
+}
+```
+
+
 ### Understanding Statistics Output
 
 The statistics output has two modes that serve different purposes:
