@@ -1127,6 +1127,76 @@ def portfolio(args):
     return 0
 
 
+def export_transactions(args):
+    import os
+    db = get_db(args)
+    cur = db.get_cursor()
+    
+    # Resolve accounts
+    accounts = resolve_accounts(db, args.account)
+    
+    # Query transactions
+    query = "SELECT date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin FROM transactions"
+    params = []
+    if accounts is not None:
+        placeholders = ','.join('?' for _ in accounts)
+        query += f" WHERE account IN ({placeholders})"
+        params.extend(accounts)
+    query += " ORDER BY date ASC, rowid ASC"
+    
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    
+    # CSV Header
+    header = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat"
+    
+    csv_lines = [header]
+    
+    def format_cell(val, is_numeric=False):
+        if val is None:
+            return "-" if is_numeric else ""
+        if is_numeric:
+            if val == 0 or val == 0.0:
+                return "-"
+            if isinstance(val, float) and val.is_integer():
+                val = int(val)
+            return str(val).replace('.', ',')
+        return str(val)
+        
+    for row in rows:
+        cells = [
+            format_cell(row[0]),  # Datum
+            format_cell(row[1]),  # Konto
+            format_cell(row[2]),  # Typ av transaktion
+            format_cell(row[3]),  # Värdepapper/beskrivning
+            format_cell(row[4], is_numeric=True),  # Antal
+            format_cell(row[5], is_numeric=True),  # Kurs
+            format_cell(row[6], is_numeric=True),  # Belopp
+            format_cell(row[7], is_numeric=True),  # Courtage
+            format_cell(row[8]),  # Valuta
+            format_cell(row[9]),  # ISIN
+            "-"                   # Resultat
+        ]
+        csv_lines.append(";".join(cells))
+        
+    content = "\n".join(csv_lines) + "\n"
+    
+    if args.output == '-':
+        print(content, end='')
+    else:
+        # Ensure parent directory exists
+        out_path = args.output
+        parent_dir = os.path.dirname(out_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir)
+            
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logging.info(f"Successfully exported {len(rows)} transactions to '{out_path}'")
+        
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Avanza investment tracker CLI",
@@ -1309,6 +1379,20 @@ Examples:
         help='Output format (default: table)'
     )
     portfolio_parser.set_defaults(func=portfolio)
+    
+    # Export command
+    export_parser = subparsers.add_parser('export', help='Export transactions to CSV')
+    export_parser.add_argument(
+        '--output',
+        default='transactions_export.csv',
+        help='Path to the output CSV file (default: transactions_export.csv)'
+    )
+    export_parser.add_argument(
+        '--account',
+        default='all',
+        help='Account ID or display name to filter (default: all)'
+    )
+    export_parser.set_defaults(func=export_transactions)
     
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')

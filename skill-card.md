@@ -37,7 +37,7 @@ Mitigation: Run reset only with explicit confirmation and keep a recent backup o
 **Other Properties Related to Output:** [May read Avanza CSV exports, write or update a local SQLite database, and optionally make Avanza price lookup requests.] <br>
 
 ## Skill Version(s): <br>
-2.5.0 (source: server release evidence) <br>
+2.6.0 (source: server release evidence) <br>
 
 
 ## Ethical Considerations: <br>
