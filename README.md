@@ -280,6 +280,13 @@ python cli.py portfolio --as-of 2026-07-06
 
 # Compare portfolio values between two dates
 python cli.py portfolio --start-date 2026-06-29 --end-date 2026-07-06
+
+# Show portfolio snapshot with Money-Weighted Rate of Return (MWRR) APY
+python cli.py portfolio --account "account1"
+
+# Show portfolio snapshot using Time-Weighted Rate of Return (TWRR) APY
+python cli.py portfolio --account "account1" --apy-mode twrr
+
 ```
 
 ## Contributing

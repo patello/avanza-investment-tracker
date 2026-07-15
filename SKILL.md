@@ -63,9 +63,11 @@ All commands accept:
 
 The `portfolio` command also accepts:
 - `--account ACCOUNTS` (default: `all`, supports comma-separated list of account IDs, `default` to use default settings, or `all` for all accounts)
+- `--apy-mode APY_MODE` (default: `mwrr`, choices: `mwrr`, `twrr`)
 
 The `portfolio`, `accounts`, and `stats` commands also accept:
 - `--format FORMAT` (default: `table`, choices: `table`, `json`)
+
 
 ## Skill Contents
 
