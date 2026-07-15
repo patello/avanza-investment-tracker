@@ -9,18 +9,17 @@ Parse transaction CSVs and compute portfolio performance metrics.
 
 ## Quick Start
 
-Run from skill root with data paths pointing to your workspace:
+Run commands from your workspace root, specifying the paths to your database and CSV:
 
 ```bash
-# Import transactions (data lives outside skill)
-python scripts/cli.py import ../data/avanza/transactions.csv
+# 1. Import new transactions
+python path/to/cli.py --database data/asset_data.db import path/to/transactions.csv
 
-# Calculate stats with auto price update
-python scripts/cli.py stats --update-prices auto --database ../data/avanza/asset_data.db
+# 2. Update price cache and show statistics
+python path/to/cli.py --database data/asset_data.db stats --update-prices auto
 
-# Or use defaults (assumes you cd into a data directory first)
-cd ../data/avanza
-python ../../skills/avanza-investment-tracker/scripts/cli.py import transactions.csv
+# 3. View portfolio allocation and APY
+python path/to/cli.py --database data/asset_data.db portfolio --account default
 ```
 
 ## Data Storage Pattern
@@ -29,98 +28,56 @@ python ../../skills/avanza-investment-tracker/scripts/cli.py import transactions
 
 ```
 workspace-finance/
-├── skills/avanza-investment-tracker/   # Portable skill (shareable)
+├── skills/avanza-investment-tracker/   # Portable skill logic
 │   ├── SKILL.md
 │   ├── scripts/
 │   └── assets/
-└── data/avanza/                        # Your private data
+└── data/avanza/                        # Private portfolio data
     ├── transactions.csv
     ├── special_cases.json
     └── asset_data.db
 ```
 
-The skill provides logic. Your data stays private and portable.
-
 ## CLI Reference
 
 | Command | Description |
-|---------|-------------|
-| `python scripts/cli.py import FILE` | Import transactions from CSV |
-| `python scripts/cli.py stats` | Show performance stats |
-| `python scripts/cli.py stats --update-prices auto` | Update prices, then show stats (default: only held assets) |
-| `python scripts/cli.py stats --update-all` | Update prices for all assets in the database, held or not |
-| `python scripts/cli.py stats --as-of DATE` | Show performance statistics as of a previous date (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`) |
-| `python scripts/cli.py stats --start-date DATE --end-date DATE` | Filter statistics and accumulated timelines by date range |
-| `python scripts/cli.py accounts` | Show account summaries |
-| `python scripts/cli.py portfolio [--as-of DATE]` | Show portfolio snapshot (cash and assets) |
-| `python scripts/cli.py portfolio --start-date DATE [--end-date DATE]` | Show portfolio change over a period |
-| `python scripts/cli.py status` | Check system status (database stats, prices, and date range) |
-| `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes all transactions/calculations, keeps settings) |
+| :--- | :--- |
+| `python scripts/cli.py import FILE` | Import transaction entries from Avanza CSV |
+| `python scripts/cli.py stats [OPTIONS]` | Calculate and display performance statistics (TWRR, deposits) |
+| `python scripts/cli.py accounts [OPTIONS]` | Display summary of all accounts with asset values and cash |
+| `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (MWRR/TWRR) |
+| `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
+| `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
+| `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
 
-All commands accept:
+### Global Options
 - `--database PATH` (default: `data/asset_data.db`)
 - `--special-cases PATH` (default: `data/special_cases.json`)
 
-The `portfolio` command also accepts:
-- `--account ACCOUNTS` (default: `all`, supports comma-separated list of account IDs, `default` to use default settings, or `all` for all accounts)
-- `--apy-mode APY_MODE` (default: `mwrr`, choices: `mwrr`, `twrr`)
+### Calculation & Output Options
+- `--account ACCOUNTS`: Limit to specific accounts (e.g. `12345,67890`, `default`, or `all`)
+- `--update-prices {auto,always,never}`: Controls when to fetch latest stock/fund prices from Avanza API
+- `--update-all`: Update prices for all assets in the database, held or not
+- `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
+- `--start-date DATE --end-date DATE`: Calculate returns over a specific date range
+- `--apy-mode {mwrr,twrr}`: APY calculation method (`mwrr` uses Modified Dietz; `twrr` uses Time-Weighted)
+- `--format {table,json}`: Output formatting (default: `table`)
 
-The `portfolio`, `accounts`, and `stats` commands also accept:
-- `--format FORMAT` (default: `table`, choices: `table`, `json`)
+### Settings Subcommands
+- `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)
+- `default-stats-period {month,year}`: Set default period for performance reports
+- `account-nickname [ACCOUNT] [NICKNAME]`: Set or list nicknames (`--list` to show all, `--remove ACCOUNT` to delete)
 
-
-## Skill Contents
-
-```
-avanza-investment-tracker/
-├── SKILL.md              # This file
-├── requirements.txt      # pip dependencies
-├── assets/               # Templates (copy to your data dir)
-│   └── special_cases_template.json
-├── scripts/              # Python code
-│   ├── cli.py           # Main CLI entry
-│   ├── data_parser.py
-│   ├── database_handler.py
-│   └── calculate_stats.py
-└── references/           # Detailed guides (loaded as needed)
-    ├── workflows.md
-    └── troubleshooting.md
-```
-
-## Dependencies
-
-- `requests` - For fetching stock prices
-- Standard library: `sqlite3`, `csv`, `json`, `datetime`, `argparse`
-
-Install: `pip install -r requirements.txt`
+---
 
 ## Special Cases
 
-Corporate actions (splits, spin-offs) may need manual rules:
-
-1. Copy template: `cp assets/special_cases_template.json ../data/avanza/special_cases.json`
-2. Edit with your rules
-3. Import with `--special-cases ../data/avanza/special_cases.json`
+Corporate actions (splits, spin-offs, zero-priced deposits) can be overridden by copying the template and defining rules:
+```bash
+cp assets/special_cases_template.json ../data/avanza/special_cases.json
+```
 
 ## See Also
 
-- **Detailed workflows**: See [references/workflows.md](references/workflows.md)
-- **Troubleshooting**: See [references/troubleshooting.md](references/troubleshooting.md)
-
-## Account Filtering
-
-By default, stats show all accounts. Use `settings default-accounts` to set your preferred accounts:
-
-```bash
-# Set default accounts (your main portfolio)
-python scripts/cli.py --database ../data/avanza/asset_data.db settings default-accounts "1234567,Savings Account,9876543"
-
-# View stats for default accounts only
-python scripts/cli.py --database ../data/avanza/asset_data.db stats --account default
-
-# Or specify accounts directly
-python scripts/cli.py stats --account "1234567,Savings Account"
-
-# View all accounts
-python scripts/cli.py stats --account all
-```
+- **Detailed workflows**: [references/workflows.md](references/workflows.md)
+- **Troubleshooting guide**: [references/troubleshooting.md](references/troubleshooting.md)
