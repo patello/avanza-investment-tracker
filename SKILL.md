@@ -55,7 +55,7 @@ The skill provides logic. Your data stays private and portable.
 | `python scripts/cli.py portfolio [--as-of DATE]` | Show portfolio snapshot (cash and assets) |
 | `python scripts/cli.py portfolio --start-date DATE [--end-date DATE]` | Show portfolio change over a period |
 | `python scripts/cli.py status` | Check system status (database stats, prices, and date range) |
-| `python scripts/cli.py reset --confirm` | Clear database (DESTRUCTIVE) |
+| `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes all transactions/calculations, keeps settings) |
 
 All commands accept:
 - `--database PATH` (default: `data/asset_data.db`)

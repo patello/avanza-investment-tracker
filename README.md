@@ -82,6 +82,9 @@ python cli.py status
 
 # Reset database state (mark all transactions as unprocessed)
 python cli.py reset
+
+# Hard reset (delete all transactions, stats, and prices while keeping configuration)
+python cli.py reset --hard
 ```
 
 All commands accept optional `--database` and `--special-cases` arguments to override default paths:

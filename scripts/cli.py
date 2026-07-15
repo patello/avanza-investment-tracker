@@ -493,13 +493,28 @@ def reset(args):
     data_parser = DataParser(db, special_cases)
     
     try:
-        data_parser.reset_processed_transactions()
+        if getattr(args, 'hard', False):
+            # Hard reset: delete all transaction and calculation tables
+            tables_to_reset = [
+                "transactions", "cohort_data", "cohort_assets", "assets",
+                "cohort_cash_flows", "asset_prices", "cohort_stats", "year_stats"
+            ]
+            for t in ["account_cohort_stats", "account_year_stats"]:
+                if t in db.tables:
+                    tables_to_reset.append(t)
+            
+            for table in tables_to_reset:
+                db.reset_table(table)
+            
+            logging.info("Database hard reset successfully (deleted all transaction and calculation tables)")
+        else:
+            data_parser.reset_processed_transactions()
+            logging.info("Database reset successfully")
         
         # Clear metadata
         for key in ['last_processed', 'last_stats_calculation']:
             db.set_metadata(key, '')
         
-        logging.info("Database reset successfully")
         return 0
         
     except Exception as e:
@@ -1212,6 +1227,11 @@ Examples:
     
     # Reset command
     reset_parser = subparsers.add_parser('reset', help='Reset database state')
+    reset_parser.add_argument(
+        '--hard',
+        action='store_true',
+        help='Hard reset: delete all transactions, stats, and prices'
+    )
     reset_parser.set_defaults(func=reset)
     
     args = parser.parse_args()

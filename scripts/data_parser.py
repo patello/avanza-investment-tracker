@@ -738,6 +738,22 @@ class DataParser:
         self.data_cur.execute("INSERT OR IGNORE INTO assets (asset) VALUES (?) ",(asset,))
         asset_id = self.data_cur.execute("SELECT asset_id FROM assets WHERE asset = ?",(asset,)).fetchone()[0]
         date = row[0]
+        
+        # Historical price lookup for transactions lacking price
+        if price <= 0.0001:
+            self.data_cur.execute("""
+                SELECT price, price_date FROM asset_prices
+                WHERE asset_id = ?
+                ORDER BY ABS(julianday(price_date) - julianday(?)) ASC
+                LIMIT 1
+            """, (asset_id, date))
+            price_row = self.data_cur.fetchone()
+            if price_row and price_row[0] > 0.0001:
+                price = price_row[0]
+                price_date_str = price_row[1]
+                logging.info(f"Resolved missing price for {asset} on {date} using closest price from database ({price} as of {price_date_str})")
+                self.data_cur.execute("UPDATE transactions SET price = ? WHERE rowid = ?", (price, row[-1]))
+
         self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
         self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         self.data_cur.execute("INSERT OR IGNORE INTO cohort_assets(month,asset_id,account) VALUES (?,?,?)",(month,asset_id,account))
@@ -946,6 +962,32 @@ class DataParser:
         row = unprocessed_lines.fetchone()
         #Consider upgrading to python3.8 to make this more elegant with := statment
         while row is not None:
+            # Re-apply special cases if defined
+            if self.special_cases is not None:
+                row_data = row[:10]
+                updated_row_data = self.special_cases.handle_special_cases(row_data)
+                
+                # Convert string representation of numbers (from special cases json) back to float
+                final_row_data = list(updated_row_data)
+                for idx in (4, 5, 6, 7):
+                    if isinstance(final_row_data[idx], str) and final_row_data[idx] not in ('-', ''):
+                        try:
+                            final_row_data[idx] = float(final_row_data[idx].replace(',', '.'))
+                        except ValueError:
+                            pass
+                updated_row_data = tuple(final_row_data)
+                
+                if updated_row_data != row_data:
+                    rowid = row[11]
+                    logging.info(f"Re-applying special case change for transaction on {row[0]}: {row_data} -> {updated_row_data}")
+                    self.data_cur.execute("""
+                        UPDATE transactions
+                        SET date = ?, account = ?, transaction_type = ?, asset_name = ?,
+                            amount = ?, price = ?, total = ?, courtage = ?, currency = ?, isin = ?
+                        WHERE rowid = ?
+                    """, updated_row_data + (rowid,))
+                    row = updated_row_data + (0, rowid)
+
             month = self.allocate_to_month(row[0])
             if row[2] == "Insättning" or row[2] == "Autogiroinsättning":
                 self.handle_deposit(row)
