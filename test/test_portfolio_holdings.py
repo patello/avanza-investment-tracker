@@ -134,3 +134,38 @@ def test_portfolio_holdings_json(holdings_test_db, capsys):
     assert holdings[1]['price'] == 80.0
     assert holdings[1]['market_value'] == 4000.0
     assert holdings[1]['allocation_percent'] == 25.0
+
+
+def test_portfolio_nickname_resolution(holdings_test_db, capsys):
+    db = DatabaseHandler(holdings_test_db)
+    cur = db.get_cursor()
+    
+    # Add nickname "Fixed Income" for account 1111
+    cur.execute("INSERT OR REPLACE INTO accounts (account_id, nickname) VALUES ('1111', 'Fixed Income')")
+    
+    # Set prices so there's non-zero values
+    cur.execute("UPDATE assets SET latest_price = 120.0, latest_price_date = '2026-01-15' WHERE asset = 'Asset A'")
+    cur.execute("UPDATE assets SET latest_price = 80.0, latest_price_date = '2026-01-15' WHERE asset = 'Asset B'")
+    db.commit()
+    
+    stat_calc = StatCalculator(db)
+    stat_calc.calculate_stats(apy_mode='mwrr')
+    
+    # Test that querying by nickname "fixed income" (case-insensitive) resolves to account 1111
+    args = argparse.Namespace(
+        database=str(holdings_test_db),
+        account='fixed income',
+        format='text',
+        apy_mode='mwrr',
+        as_of=None
+    )
+    
+    portfolio(args)
+    captured = capsys.readouterr()
+    
+    output = captured.out
+    assert "Account 1111" in output
+    assert "Fixed Income" in output
+    assert "Asset A" in output
+    assert "12,000 SEK" in output
+

@@ -190,26 +190,41 @@ def parse_date_bound(date_str, is_start_bound=False):
     raise ValueError(f"Invalid date format: '{date_str}'. Supported formats: YYYY, YYYY-MM, YYYY-MM-DD")
 
 
+def resolve_accounts(db, account_arg):
+    """Parse account argument and resolve display names/nicknames to account IDs."""
+    account_arg = account_arg.strip()
+    if account_arg.lower() == 'all':
+        return None
+        
+    if account_arg.lower() == 'default':
+        default_accounts_str = db.get_metadata('default_accounts')
+        if not default_accounts_str:
+            return None
+        raw_accounts = [acc.strip() for acc in default_accounts_str.split(',')]
+    else:
+        raw_accounts = [acc.strip() for acc in account_arg.split(',')]
+        
+    # Resolve nicknames to numeric IDs
+    nicknames = db.get_all_account_nicknames()
+    reverse_nicknames = {v.lower().strip(): k for k, v in nicknames.items()}
+    
+    resolved = []
+    for acc in raw_accounts:
+        acc_lower = acc.lower().strip()
+        if acc_lower in reverse_nicknames:
+            resolved.append(reverse_nicknames[acc_lower])
+        else:
+            resolved.append(acc)
+    return resolved
+
+
 def stats(args):
+
     """Smart statistics command with automatic updates."""
     db = get_db(args)
     
     # Parse account filter
-    account_arg = args.account.strip()
-    accounts = None
-    
-    if account_arg.lower() == 'all':
-        accounts = None  # None means all accounts
-    elif account_arg.lower() == 'default':
-        # Get default accounts from metadata
-        default_accounts_str = db.get_metadata('default_accounts')
-        if default_accounts_str is None or default_accounts_str == '':
-            accounts = None  # No default set, use all accounts
-        else:
-            accounts = [acc.strip() for acc in default_accounts_str.split(',')]
-    else:
-        # Comma-separated list of accounts
-        accounts = [acc.strip() for acc in account_arg.split(',')]
+    accounts = resolve_accounts(db, args.account)
     
     # Parse as_of, start_date, end_date
     as_of = None
@@ -595,21 +610,7 @@ def accounts_summary(args):
     db = get_db(args)
     
     # Parse account filter (same logic as stats)
-    account_arg = args.account.strip()
-    accounts = None
-    
-    if account_arg.lower() == 'all':
-        accounts = None  # None means all accounts
-    elif account_arg.lower() == 'default':
-        # Get default accounts from metadata
-        default_accounts_str = db.get_metadata('default_accounts')
-        if default_accounts_str is None or default_accounts_str == '':
-            accounts = None  # No default set, use all accounts
-        else:
-            accounts = [acc.strip() for acc in default_accounts_str.split(',')]
-    else:
-        # Comma-separated list of accounts
-        accounts = [acc.strip() for acc in account_arg.split(',')]
+    accounts = resolve_accounts(db, args.account)
     
     # Update prices if needed (same logic as stats)
     update_all = getattr(args, 'update_all', False)
@@ -702,16 +703,7 @@ def portfolio(args):
         return 1
             
     # Parse account filter
-    account_arg = args.account.strip()
-    accounts = None
-    if account_arg.lower() == 'all':
-        accounts = None
-    elif account_arg.lower() == 'default':
-        default_accounts_str = db.get_metadata('default_accounts')
-        if default_accounts_str:
-            accounts = [acc.strip() for acc in default_accounts_str.split(',')]
-    else:
-        accounts = [acc.strip() for acc in account_arg.split(',')]
+    accounts = resolve_accounts(db, args.account)
         
     # Get all distinct accounts from transactions up to end_date (or all time if end_date is None)
     if accounts is None:
