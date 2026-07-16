@@ -364,8 +364,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 - `--update-all` (stats only): Update prices for all assets in the database, held or not
 - `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
 - `--cohorts-start DATE --cohorts-end DATE`: Filter which deposit cohorts are displayed
-- `--value-start DATE --value-end DATE`: Set the performance valuation window (double snapshot)
-- `--start DATE --end DATE` / `--start-date DATE --end-date DATE`: Shorthand that sets both cohorts and value windows to same dates
+- `--from DATE --to DATE`: Set the performance valuation window (double snapshot)
 - `--positions`, `-p` (stats only): Show positions holdings breakdown under each cohort (or summary)
 - `--summary`, `-s` (stats only): Consolidate cohort statistics into a single overview block
 - `--apy-mode {mwrr,twrr}`: APY calculation method (`mwrr` uses Modified Dietz; `twrr` uses Time-Weighted)
@@ -377,11 +376,11 @@ python cli.py portfolio --account "account1" --apy-mode twrr
    Use `--cohorts-start YYYY-MM` / `--cohorts-end YYYY-MM`
    *Example:* `python scripts/cli.py stats --cohorts-start 2024-01`
 2. **To see all cohorts' performance over a specific valuation window:**
-   Use `--value-start YYYY-MM` / `--value-end YYYY-MM` (or `--as-of YYYY-MM`)
-   *Example:* `python scripts/cli.py stats --value-start 2024-01 --value-end 2024-12`
-3. **To see cohorts created in a period AND their performance during that same period:**
-   Use `--start YYYY-MM` / `--end YYYY-MM`
-   *Example:* `python scripts/cli.py stats --start 2024-01 --end 2024-12`
+   Use `--from YYYY-MM` / `--to YYYY-MM` (or `--as-of YYYY-MM`)
+   *Example:* `python scripts/cli.py stats --from 2024-01 --to 2024-12`
+
+> [!NOTE]
+> In double-snapshot mode (`--from` / `--to`), the cohort-level output displays **`Start Value`** instead of **`Deposited`** for any cohorts created before the start date. Additionally, the **`Withdrawal`** line displays withdrawals made *specifically within the selected date range*, while withdrawals made prior to the start date are already accounted for in `Start Value`.
 
 ### Settings Subcommands
 - `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)
