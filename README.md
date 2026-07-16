@@ -342,6 +342,59 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 
 ```
 
+## CLI Reference
+
+| Command | Description |
+| :--- | :--- |
+| `python scripts/cli.py import FILE` | Import transaction entries from Avanza CSV |
+| `python scripts/cli.py stats [OPTIONS]` | Calculate and display cohort performance statistics (TWRR, deposits) |
+| `python scripts/cli.py accounts [OPTIONS]` | Display summary of all accounts with asset values and cash |
+| `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (alias to `stats --positions --summary`) |
+| `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
+| `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
+| `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
+
+### Global Options
+- `--database PATH` (default: `data/asset_data.db`)
+- `--special-cases PATH` (default: `data/special_cases.json`)
+
+### Calculation & Output Options
+- `--account ACCOUNTS`: Limit to specific accounts (e.g. `12345,67890`, `default`, or `all`)
+- `--update-prices {auto,always,never}` (stats only): Controls when to fetch latest stock/fund prices from Avanza API
+- `--update-all` (stats only): Update prices for all assets in the database, held or not
+- `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
+- `--cohorts-start DATE --cohorts-end DATE`: Filter which deposit cohorts are displayed
+- `--value-start DATE --value-end DATE`: Set the performance valuation window (double snapshot)
+- `--start DATE --end DATE` / `--start-date DATE --end-date DATE`: Shorthand that sets both cohorts and value windows to same dates
+- `--positions`, `-p` (stats only): Show positions holdings breakdown under each cohort (or summary)
+- `--summary`, `-s` (stats only): Consolidate cohort statistics into a single overview block
+- `--apy-mode {mwrr,twrr}`: APY calculation method (`mwrr` uses Modified Dietz; `twrr` uses Time-Weighted)
+- `--format {table,json}`: Output formatting (default: `table`)
+- `--quiet`, `-q`: Suppress price data staleness warnings
+
+### Guidelines: When to use what date boundaries
+1. **To see how cohorts from a certain period look today:**
+   Use `--cohorts-start YYYY-MM` / `--cohorts-end YYYY-MM`
+   *Example:* `python scripts/cli.py stats --cohorts-start 2024-01`
+2. **To see all cohorts' performance over a specific valuation window:**
+   Use `--value-start YYYY-MM` / `--value-end YYYY-MM` (or `--as-of YYYY-MM`)
+   *Example:* `python scripts/cli.py stats --value-start 2024-01 --value-end 2024-12`
+3. **To see cohorts created in a period AND their performance during that same period:**
+   Use `--start YYYY-MM` / `--end YYYY-MM`
+   *Example:* `python scripts/cli.py stats --start 2024-01 --end 2024-12`
+
+### Settings Subcommands
+- `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)
+- `default-stats-period {month,year}`: Set default period for performance reports
+- `account-nickname [ACCOUNT] [NICKNAME]`: Set or list nicknames (`--list` to show all, `--remove ACCOUNT` to delete)
+
+## Special Cases
+
+Corporate actions (splits, spin-offs, zero-priced deposits) can be overridden by copying the template and defining rules:
+```bash
+cp assets/special_cases_template.json ../data/avanza/special_cases.json
+```
+
 ## Contributing
 
 Thank you for your interest in contributing to this project! As a single-person hobby project, contributions are not expected but always welcome. If you have any ideas, bug fixes, or improvements, feel free to submit a pull request.
