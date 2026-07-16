@@ -232,3 +232,38 @@ def test_multi_account_stats_preserves_multiple_cohorts(stats_positions_test_db)
     # We should have cohorts from both accounts, meaning at least 2 cohort months
     assert len(res) >= 2
 
+def test_dynamic_label_valuation(stats_positions_test_db, capsys):
+    # Setup stats namespace with from_date='2025-06-01' and to='2025-12-31' in table format
+    args = argparse.Namespace(
+        database=str(stats_positions_test_db),
+        account='1111',
+        period='default',
+        deposits='current',
+        accumulated=False,
+        update_prices='never',
+        update_all=False,
+        force=False,
+        apy_mode='mwrr',
+        as_of=None,
+        cohorts_start=None,
+        cohorts_end=None,
+        from_date='2025-06-01',
+        to='2025-12-31',
+        positions=False,
+        summary=False,
+        format='table',
+        quiet=True
+    )
+    stats(args)
+    captured = capsys.readouterr()
+    
+    # Dec 2024 is the first cohort month in the test database.
+    # It existed before the June 2025 window, so it should display "Start Value: 10000".
+    assert "Dec 2024" in captured.out
+    assert "Start Value: 10000" in captured.out
+    
+    # May 2025 is the second cohort month, which also has its deposit on 2025-06-01 included in the start snapshot, so it shows "Start Value: 5000".
+    assert "May 2025" in captured.out
+    assert "Start Value: 5000" in captured.out
+
+

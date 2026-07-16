@@ -565,11 +565,11 @@ def stats(args):
                     
                     stats_list.append((
                         end_row[0], p_dep, p_with, p_val, p_gain, p_real, p_unreal,
-                        p_gain_pct, p_real_pct, p_unreal_pct, p_apy
+                        p_gain_pct, p_real_pct, p_unreal_pct, p_apy, start_row[3]
                     ))
                 else:
                     # Cohort didn't exist at value_start
-                    stats_list.append(end_row)
+                    stats_list.append(end_row + (0.0,))
         else:
             stats_list = stat_calc.get_stats(**kwargs)
             
@@ -717,7 +717,6 @@ def stats(args):
                         cohort_month = row[0]
                         cohort_data = {
                             'date': serialize_date(cohort_month),
-                            'deposit': row[1],
                             'withdrawal': row[2],
                             'value': row[3],
                             'total_gainloss': row[4],
@@ -728,6 +727,14 @@ def stats(args):
                             'unrealized_gainloss_percent': row[9],
                             'apy': row[10]
                         }
+                        if value_start is not None:
+                            start_val = row[11] if len(row) > 11 else 0.0
+                            if start_val > 0:
+                                cohort_data['start_value'] = start_val
+                            else:
+                                cohort_data['deposit'] = row[1]
+                        else:
+                            cohort_data['deposit'] = row[1]
                         if getattr(args, 'positions', False):
                             cohort_holdings = get_stats_holdings(active_db, cohort_month=cohort_month, accounts=accounts)
                             for h in cohort_holdings:
@@ -758,7 +765,14 @@ def stats(args):
                             display_date = str(cohort_month)
                             
                         print(display_date)
-                        print(f"Deposited: {row[1]:.0f}")
+                        if value_start is not None:
+                            start_val = row[11] if len(row) > 11 else 0.0
+                            if start_val > 0:
+                                print(f"Start Value: {start_val:.0f}")
+                            else:
+                                print(f"Deposited: {row[1]:.0f}")
+                        else:
+                            print(f"Deposited: {row[1]:.0f}")
                         print(f"Value: {row[3]:.0f}")
                         print(f"Withdrawal: {row[2]:.0f}")
                         gl_sign = "+" if row[4] > 0 else ""
