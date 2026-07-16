@@ -267,3 +267,86 @@ def test_dynamic_label_valuation(stats_positions_test_db, capsys):
     assert "Start Value: 5000" in captured.out
 
 
+def test_cohort_shorthand_filtering(stats_positions_test_db, capsys):
+    # Test --cohort YYYY-MM
+    args1 = argparse.Namespace(
+        database=str(stats_positions_test_db),
+        account='1111',
+        period='default',
+        deposits='current',
+        accumulated=False,
+        update_prices='never',
+        update_all=False,
+        force=False,
+        apy_mode='mwrr',
+        as_of=None,
+        cohort='2024-12',  # filters to Dec 2024 cohort
+        cohorts_start=None,
+        cohorts_end=None,
+        from_date=None,
+        to=None,
+        positions=False,
+        summary=False,
+        format='table',
+        quiet=True
+    )
+    stats(args1)
+    captured1 = capsys.readouterr()
+    assert "Dec 2024" in captured1.out
+    assert "May 2025" not in captured1.out
+
+    # Test --cohort YYYY
+    args2 = argparse.Namespace(
+        database=str(stats_positions_test_db),
+        account='1111',
+        period='default',
+        deposits='current',
+        accumulated=False,
+        update_prices='never',
+        update_all=False,
+        force=False,
+        apy_mode='mwrr',
+        as_of=None,
+        cohort='2025',  # filters to 2025 cohorts (May 2025)
+        cohorts_start=None,
+        cohorts_end=None,
+        from_date=None,
+        to=None,
+        positions=False,
+        summary=False,
+        format='table',
+        quiet=True
+    )
+    stats(args2)
+    captured2 = capsys.readouterr()
+    # Dec 2024 is NOT in 2025 and should be grouped under 2024
+    assert "2024" not in captured2.out
+    # May 2025 is in 2025 and should be grouped under 2025
+    assert "2025" in captured2.out
+
+    # Test mutual exclusivity with cohorts_start
+    args3 = argparse.Namespace(
+        database=str(stats_positions_test_db),
+        account='1111',
+        period='default',
+        deposits='current',
+        accumulated=False,
+        update_prices='never',
+        update_all=False,
+        force=False,
+        apy_mode='mwrr',
+        as_of=None,
+        cohort='2025',
+        cohorts_start='2025-01-01',
+        cohorts_end=None,
+        from_date=None,
+        to=None,
+        positions=False,
+        summary=False,
+        format='table',
+        quiet=True
+    )
+    assert stats(args3) == 1  # Should return error code 1
+
+
+

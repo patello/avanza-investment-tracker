@@ -430,8 +430,32 @@ def stats(args):
     try:
         as_of = parse_date_bound(getattr(args, 'as_of', None), is_start_bound=False)
         
-        c_start_raw = getattr(args, 'cohorts_start', None)
-        c_end_raw = getattr(args, 'cohorts_end', None)
+        cohort_raw = getattr(args, 'cohort', None)
+        if cohort_raw is not None:
+            c_start_raw = getattr(args, 'cohorts_start', None)
+            c_end_raw = getattr(args, 'cohorts_end', None)
+            if c_start_raw is not None or c_end_raw is not None:
+                logging.error("Cannot specify both --cohort and --cohorts-start/--cohorts-end")
+                return 1
+                
+            import re
+            if re.match(r"^\d{4}-\d{2}$", cohort_raw):
+                c_start_raw = cohort_raw
+                c_end_raw = cohort_raw
+                if getattr(args, 'period', 'default') == 'default':
+                    args.period = 'month'
+            elif re.match(r"^\d{4}$", cohort_raw):
+                c_start_raw = f"{cohort_raw}-01"
+                c_end_raw = f"{cohort_raw}-12"
+                if getattr(args, 'period', 'default') == 'default':
+                    args.period = 'year'
+            else:
+                logging.error(f"Invalid --cohort format: '{cohort_raw}'. Must be YYYY-MM or YYYY.")
+                return 1
+        else:
+            c_start_raw = getattr(args, 'cohorts_start', None)
+            c_end_raw = getattr(args, 'cohorts_end', None)
+            
         v_start_raw = getattr(args, 'from_date', None)
         v_end_raw = getattr(args, 'to', None)
         
@@ -1102,6 +1126,7 @@ def portfolio(args):
         as_of=getattr(args, 'as_of', None),
         cohorts_start=getattr(args, 'cohorts_start', None),
         cohorts_end=getattr(args, 'cohorts_end', None),
+        cohort=getattr(args, 'cohort', None),
         from_date=getattr(args, 'from_date', None),
         to=getattr(args, 'to', None),
         positions=True,
@@ -1281,6 +1306,11 @@ Examples:
         help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
+        '--cohort',
+        default=None,
+        help='Shorthand to filter by a single cohort month (YYYY-MM) or year (YYYY) (default: None)'
+    )
+    stats_parser.add_argument(
         '--from',
         dest='from_date',
         default=None,
@@ -1378,6 +1408,11 @@ Examples:
         '--cohorts-end',
         default=None,
         help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--cohort',
+        default=None,
+        help='Shorthand to filter by a single cohort month (YYYY-MM) or year (YYYY) (default: None)'
     )
     portfolio_parser.add_argument(
         '--from',

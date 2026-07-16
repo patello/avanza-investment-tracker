@@ -364,6 +364,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 - `--update-all` (stats only): Update prices for all assets in the database, held or not
 - `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
 - `--cohorts-start DATE --cohorts-end DATE`: Filter which deposit cohorts are displayed
+- `--cohort DATE`: Shorthand to filter by a single cohort month (`YYYY-MM`) or year (`YYYY`) (e.g. `--cohort 2024` groups yearly, `--cohort 2024-12` groups monthly)
 - `--from DATE --to DATE`: Set the performance valuation window (double snapshot)
 - `--positions`, `-p` (stats only): Show positions holdings breakdown under each cohort (or summary)
 - `--summary`, `-s` (stats only): Consolidate cohort statistics into a single overview block
@@ -378,6 +379,10 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 2. **To see all cohorts' performance over a specific valuation window:**
    Use `--from YYYY-MM` / `--to YYYY-MM` (or `--as-of YYYY-MM`)
    *Example:* `python scripts/cli.py stats --from 2024-01 --to 2024-12`
+3. **To see only a single cohort month or year:**
+   Use `--cohort YYYY-MM` or `--cohort YYYY`
+   *Example:* `python scripts/cli.py stats --cohort 2024-12` (sets date range to `2024-12` and default grouping to monthly)
+   *Example:* `python scripts/cli.py stats --cohort 2024` (sets date range to `2024-01` to `2024-12` and default grouping to yearly)
 
 > [!NOTE]
 > In double-snapshot mode (`--from` / `--to`), the cohort-level output displays **`Start Value`** instead of **`Deposited`** for any cohorts created before the start date. Additionally, the **`Withdrawal`** line displays withdrawals made *specifically within the selected date range*, while withdrawals made prior to the start date are already accounted for in `Start Value`.
