@@ -782,10 +782,10 @@ class StatCalculator:
                 else:
                     month_date = month
 
-                start_date = month_date.replace(day=15)
+                cohort_start_date = month_date.replace(day=15)
                 annual_per_yield = self._calc_apy_multi(
                     apy_mode, accounts, value, deposit, total_gainloss,
-                    month, start_date, today, cur)
+                    month, cohort_start_date, today, cur)
                 
                 stats.append((
                     month_date, deposit, withdrawal, value,
@@ -842,10 +842,10 @@ class StatCalculator:
                     realized_gainloss_per = 0.0
                     unrealized_gainloss_per = 0.0
                 
-                start_date = datetime(year=year, month=7, day=1).date()
+                cohort_start_date = datetime(year=year, month=7, day=1).date()
                 annual_per_yield = self._calc_apy_year_multi(
                     apy_mode, accounts, value, deposit, total_gainloss,
-                    str(year), start_date, today, cur)
+                    str(year), cohort_start_date, today, cur)
                 
                 stats.append((
                     date(year, 1, 1), deposit, withdrawal, value,

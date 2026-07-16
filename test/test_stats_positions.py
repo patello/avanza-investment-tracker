@@ -229,3 +229,18 @@ def test_period_valuation(stats_positions_test_db, capsys):
     data = json.loads(captured.out)
     # Check that performance is filtered
     assert len(data) > 0
+
+def test_multi_account_stats_preserves_multiple_cohorts(stats_positions_test_db):
+    # Setup StatCalculator and query multi-account stats
+    from calculate_stats import StatCalculator
+    from database_handler import DatabaseHandler
+    
+    db = DatabaseHandler(str(stats_positions_test_db))
+    stat_calc = StatCalculator(db)
+    
+    # We query for both accounts ('1111' and '2222')
+    res = stat_calc.get_stats(accounts=['1111', '2222'], period='month', deposits='all')
+    
+    # We should have cohorts from both accounts, meaning at least 2 cohort months
+    assert len(res) >= 2
+

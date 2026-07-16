@@ -347,6 +347,9 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
     parser.process_transactions()
     
     # Resolve prices
+    held_assets_rows = temp_cur.execute("SELECT DISTINCT asset_id FROM cohort_assets WHERE amount > 0.001").fetchall()
+    held_asset_ids = {row[0] for row in held_assets_rows}
+    
     assets = temp_cur.execute("SELECT asset_id, asset FROM assets").fetchall()
     for asset_id, asset_name in assets:
         price_row = temp_cur.execute("""
@@ -360,7 +363,8 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
                 SET latest_price = ?, latest_price_date = ?
                 WHERE asset_id = ?
             """, (price_row[0], price_row[1], asset_id))
-            check_price_staleness(asset_name, price_row[1], t_date, warnings)
+            if asset_id in held_asset_ids:
+                check_price_staleness(asset_name, price_row[1], t_date, warnings)
     temp_db.commit()
     
     stat_calc = StatCalculator(temp_db)
