@@ -392,22 +392,9 @@ def stats(args):
         
         c_start_raw = getattr(args, 'cohorts_start', None)
         c_end_raw = getattr(args, 'cohorts_end', None)
-        v_start_raw = getattr(args, 'value_start', None)
-        v_end_raw = getattr(args, 'value_end', None)
-        start_raw = getattr(args, 'start', None)
-        end_raw = getattr(args, 'end', None)
+        v_start_raw = getattr(args, 'from_date', None)
+        v_end_raw = getattr(args, 'to', None)
         
-        # Fallbacks
-        if c_start_raw is None:
-            c_start_raw = start_raw
-        if v_start_raw is None:
-            v_start_raw = start_raw
-            
-        if c_end_raw is None:
-            c_end_raw = end_raw
-        if v_end_raw is None:
-            v_end_raw = end_raw
-            
         if v_end_raw is None and as_of is not None:
             v_end_raw = getattr(args, 'as_of', None)
             
@@ -1067,10 +1054,8 @@ def portfolio(args):
         as_of=getattr(args, 'as_of', None),
         cohorts_start=getattr(args, 'cohorts_start', None),
         cohorts_end=getattr(args, 'cohorts_end', None),
-        value_start=getattr(args, 'start', None),
-        value_end=getattr(args, 'end', None),
-        start=None,
-        end=None,
+        from_date=getattr(args, 'from_date', None),
+        to=getattr(args, 'to', None),
         positions=True,
         summary=True,
         is_portfolio=True,
@@ -1248,26 +1233,15 @@ Examples:
         help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
-        '--value-start',
+        '--from',
+        dest='from_date',
         default=None,
-        help='Start date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='Start date for valuation performance period (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
-        '--value-end',
+        '--to',
         default=None,
-        help='End date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
-    )
-    stats_parser.add_argument(
-        '--start', '--start-date',
-        dest='start',
-        default=None,
-        help='Shorthand setting both --cohorts-start and --value-start (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
-    )
-    stats_parser.add_argument(
-        '--end', '--end-date',
-        dest='end',
-        default=None,
-        help='Shorthand setting both --cohorts-end and --value-end (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='End date for valuation performance period (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
         '--positions', '-p',
@@ -1358,26 +1332,15 @@ Examples:
         help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
-        '--value-start',
+        '--from',
+        dest='from_date',
         default=None,
-        help='Start date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='Start date for valuation performance period (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
-        '--value-end',
+        '--to',
         default=None,
-        help='End date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
-    )
-    portfolio_parser.add_argument(
-        '--start', '--start-date',
-        dest='start',
-        default=None,
-        help='Shorthand setting both --cohorts-start and --value-start (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
-    )
-    portfolio_parser.add_argument(
-        '--end', '--end-date',
-        dest='end',
-        default=None,
-        help='Shorthand setting both --cohorts-end and --value-end (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='End date for valuation performance period (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
         '--account',
