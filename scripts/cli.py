@@ -218,6 +218,34 @@ def resolve_accounts(db, account_arg):
     return resolved
 
 
+def check_price_staleness(asset_name, price_date_str, target_date, warnings_list, threshold_days=30):
+    if not price_date_str or not target_date:
+        return
+    try:
+        from datetime import datetime, date
+        if isinstance(price_date_str, str):
+            p_date = datetime.strptime(price_date_str, "%Y-%m-%d").date()
+        elif isinstance(price_date_str, (datetime, date)):
+            p_date = price_date_str if isinstance(price_date_str, date) else price_date_str.date()
+        else:
+            return
+
+        if isinstance(target_date, str):
+            t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        elif isinstance(target_date, (datetime, date)):
+            t_date = target_date if isinstance(target_date, date) else target_date.date()
+        else:
+            return
+
+        days_stale = (t_date - p_date).days
+        if days_stale > threshold_days:
+            warn_msg = f"WARNING: {asset_name} priced from {price_date_str}, {days_stale} days stale for valuation date {t_date.isoformat()}"
+            if warn_msg not in warnings_list:
+                warnings_list.append(warn_msg)
+    except Exception:
+        pass
+
+
 def stats(args):
 
     """Smart statistics command with automatic updates."""
@@ -355,8 +383,9 @@ def stats(args):
             parser.process_transactions()
             
             # Resolve prices as of target_date
-            assets = temp_cur.execute("SELECT asset_id FROM assets").fetchall()
-            for (asset_id,) in assets:
+            assets = temp_cur.execute("SELECT asset_id, asset FROM assets").fetchall()
+            warnings = []
+            for asset_id, asset_name in assets:
                 price_row = temp_cur.execute("""
                     SELECT price, price_date FROM asset_prices
                     WHERE asset_id = ? AND price_date <= ?
@@ -368,7 +397,12 @@ def stats(args):
                         SET latest_price = ?, latest_price_date = ?
                         WHERE asset_id = ?
                     """, (price_row[0], price_row[1], asset_id))
+                    check_price_staleness(asset_name, price_row[1], target_date, warnings)
             temp_db.commit()
+            
+            if warnings and not getattr(args, 'quiet', False):
+                for warning in warnings:
+                    print(warning, file=sys.stderr)
             
             # Calculate stats dynamically
             stat_calc = StatCalculator(temp_db)
@@ -685,6 +719,7 @@ def portfolio(args):
     """Show portfolio snapshot or change over a period."""
     db = get_db(args)
     cur = db.get_cursor()
+    warnings = []
     
     # Parse dates
     as_of = None
@@ -751,9 +786,10 @@ def portfolio(args):
             
             assets_value = 0.0
             for asset_name, amt in holdings:
+                price_date = None
                 if as_of_date:
                     price_query = """
-                        SELECT ap.price FROM asset_prices ap
+                        SELECT ap.price, ap.price_date FROM asset_prices ap
                         JOIN assets a ON ap.asset_id = a.asset_id
                         WHERE a.asset = ? AND ap.price_date <= ?
                         ORDER BY ap.price_date DESC LIMIT 1
@@ -762,16 +798,21 @@ def portfolio(args):
                     p_row = cur.fetchone()
                     if p_row:
                         price = p_row[0]
+                        price_date = p_row[1]
                     else:
-                        cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                        cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
                         fallback_row = cur.fetchone()
                         price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
+                        price_date = fallback_row[1] if fallback_row and len(fallback_row) > 1 else None
                 else:
-                    cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                    cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
                     p_row = cur.fetchone()
                     price = p_row[0] if p_row and p_row[0] is not None else 0.0
+                    price_date = p_row[1] if p_row and len(p_row) > 1 else None
                     
                 assets_value += amt * price
+                val_date = as_of_date if as_of_date is not None else datetime.today().date()
+                check_price_staleness(asset_name, price_date, val_date, warnings)
                 
             summaries[account] = {
                 'cash': cash,
@@ -785,7 +826,7 @@ def portfolio(args):
         if as_of_date is None:
             # Query cohort_assets for current holdings
             query = """
-                SELECT a.asset, SUM(ca.amount) AS held_amount, a.latest_price
+                SELECT a.asset, SUM(ca.amount) AS held_amount, a.latest_price, a.latest_price_date
                 FROM cohort_assets ca
                 JOIN assets a ON ca.asset_id = a.asset_id
                 WHERE ca.account = ?
@@ -795,7 +836,7 @@ def portfolio(args):
             """
             cur.execute(query, (account,))
             rows = cur.fetchall()
-            for asset_name, amt, price in rows:
+            for asset_name, amt, price, price_date in rows:
                 price_val = price if price is not None else 0.0
                 holdings.append({
                     'asset': asset_name,
@@ -803,6 +844,7 @@ def portfolio(args):
                     'price': price_val,
                     'market_value': amt * price_val
                 })
+                check_price_staleness(asset_name, price_date, datetime.today().date(), warnings)
         else:
             # Past holdings from transactions
             query = """
@@ -818,7 +860,7 @@ def portfolio(args):
             for asset_name, amt in rows:
                 # Get price as of as_of_date
                 price_query = """
-                    SELECT ap.price FROM asset_prices ap
+                    SELECT ap.price, ap.price_date FROM asset_prices ap
                     JOIN assets a ON ap.asset_id = a.asset_id
                     WHERE a.asset = ? AND ap.price_date <= ?
                     ORDER BY ap.price_date DESC LIMIT 1
@@ -827,10 +869,12 @@ def portfolio(args):
                 p_row = cur.fetchone()
                 if p_row:
                     price = p_row[0]
+                    price_date = p_row[1]
                 else:
-                    cur.execute("SELECT latest_price FROM assets WHERE asset = ?", (asset_name,))
+                    cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
                     fallback_row = cur.fetchone()
                     price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
+                    price_date = fallback_row[1] if fallback_row and len(fallback_row) > 1 else None
                 
                 holdings.append({
                     'asset': asset_name,
@@ -838,6 +882,7 @@ def portfolio(args):
                     'price': price,
                     'market_value': amt * price
                 })
+                check_price_staleness(asset_name, price_date, as_of_date, warnings)
             
             # Sort by market value descending
             holdings.sort(key=lambda x: x['market_value'], reverse=True)
@@ -1124,6 +1169,11 @@ def portfolio(args):
                 
                 print(f"{'TOTAL':<{name_width}} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f} {total_deposits:>12.0f} {total_gl_sign}{total_gainloss:>13.0f} {total_gl_pct_sign}{total_gain_percent:>8.1f}% {total_apy_str:>8}")
             
+    if warnings and not getattr(args, 'quiet', False):
+        import sys
+        for warning in warnings:
+            print(warning, file=sys.stderr)
+            
     return 0
 
 
@@ -1294,6 +1344,11 @@ Examples:
         default='table',
         help='Output format (default: table)'
     )
+    stats_parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Suppress price data staleness warnings'
+    )
     stats_parser.set_defaults(func=stats)
     
     # Settings command
@@ -1377,6 +1432,11 @@ Examples:
         choices=['table', 'json'],
         default='table',
         help='Output format (default: table)'
+    )
+    portfolio_parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Suppress price data staleness warnings'
     )
     portfolio_parser.set_defaults(func=portfolio)
     
