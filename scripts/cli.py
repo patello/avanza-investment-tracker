@@ -631,6 +631,7 @@ def stats(args):
                     
             if getattr(args, 'format', 'table') == 'json':
                 import json
+                net_transfers = total_val + total_with - start_val - total_dep - total_gain
                 result = {
                     'period': f"{value_start.isoformat()} to {target_end_date.isoformat()}" if value_start else "all",
                     'deposits': total_dep,
@@ -640,6 +641,10 @@ def stats(args):
                     'total_gain_percent': (total_gain / (start_val + total_dep) * 100) if ((start_val + total_dep) > 0) else 0.0,
                     'apy': blended_apy
                 }
+                if abs(net_transfers) > 0.01:
+                    result['net_transfers'] = net_transfers
+                if value_start is not None:
+                    result['start_value'] = start_val
                 if accounts is not None and len(accounts) == 1:
                     acc_id = list(accounts)[0]
                     nicknames = db.get_all_account_nicknames()
@@ -676,7 +681,14 @@ def stats(args):
                 else:
                     header_title = f"Summary — {period_label}"
                 print(f"{header_title}\n")
+                net_transfers = total_val + total_with - start_val - total_dep - total_gain
+                if value_start is not None:
+                    print(f"Start Value:       {start_val:,.0f} SEK")
                 print(f"Total Deposited:   {total_dep:,.0f} SEK")
+                print(f"Total Withdrawn:   {total_with:,.0f} SEK")
+                if abs(net_transfers) > 0.01:
+                    trans_sign = "+" if net_transfers > 0 else ""
+                    print(f"Net Transfers:     {trans_sign}{net_transfers:,.0f} SEK")
                 print(f"Current Value:     {total_val:,.0f} SEK")
                 
                 gl_sign = "+" if total_gain > 0 else ""
