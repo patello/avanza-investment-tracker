@@ -314,6 +314,46 @@ def get_stats_holdings(db, cohort_month=None, cohorts_start=None, cohorts_end=No
     return holdings
 
 
+def is_cohort_older(cohort_month, value_start, period):
+    if value_start is None:
+        return False
+    
+    from datetime import date, datetime
+    c_year = None
+    c_date = None
+    
+    if hasattr(cohort_month, 'year'):
+        c_year = cohort_month.year
+        if hasattr(cohort_month, 'month'):
+            c_date = date(cohort_month.year, cohort_month.month, cohort_month.day) if hasattr(cohort_month, 'day') else date(cohort_month.year, cohort_month.month, 1)
+        else:
+            c_date = date(cohort_month.year, 1, 1)
+    else:
+        try:
+            s = str(cohort_month)
+            if len(s) == 4:
+                c_year = int(s)
+                c_date = date(c_year, 1, 1)
+            elif len(s) == 7:
+                dt = datetime.strptime(s, "%Y-%m")
+                c_year = dt.year
+                c_date = dt.date()
+            else:
+                dt = datetime.strptime(s[:10], "%Y-%m-%d")
+                c_year = dt.year
+                c_date = dt.date()
+        except Exception:
+            pass
+            
+    if c_date is None:
+        return False
+        
+    if period == "year":
+        return c_year < value_start.year
+    else:
+        return (c_date.year, c_date.month) < (value_start.year, value_start.month)
+
+
 def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warnings):
     import shutil
     import os
@@ -727,12 +767,9 @@ def stats(args):
                             'unrealized_gainloss_percent': row[9],
                             'apy': row[10]
                         }
-                        if value_start is not None:
+                        if value_start is not None and is_cohort_older(cohort_month, value_start, period):
                             start_val = row[11] if len(row) > 11 else 0.0
-                            if start_val > 0:
-                                cohort_data['start_value'] = start_val
-                            else:
-                                cohort_data['deposit'] = row[1]
+                            cohort_data['start_value'] = start_val
                         else:
                             cohort_data['deposit'] = row[1]
                         if getattr(args, 'positions', False):
@@ -765,12 +802,9 @@ def stats(args):
                             display_date = str(cohort_month)
                             
                         print(display_date)
-                        if value_start is not None:
+                        if value_start is not None and is_cohort_older(cohort_month, value_start, period):
                             start_val = row[11] if len(row) > 11 else 0.0
-                            if start_val > 0:
-                                print(f"Start Value: {start_val:.0f}")
-                            else:
-                                print(f"Deposited: {row[1]:.0f}")
+                            print(f"Start Value: {start_val:.0f}")
                         else:
                             print(f"Deposited: {row[1]:.0f}")
                         print(f"Value: {row[3]:.0f}")
