@@ -43,9 +43,9 @@ workspace-finance/
 | Command | Description |
 | :--- | :--- |
 | `python scripts/cli.py import FILE` | Import transaction entries from Avanza CSV |
-| `python scripts/cli.py stats [OPTIONS]` | Calculate and display performance statistics (TWRR, deposits) |
+| `python scripts/cli.py stats [OPTIONS]` | Calculate and display cohort performance statistics (TWRR, deposits) |
 | `python scripts/cli.py accounts [OPTIONS]` | Display summary of all accounts with asset values and cash |
-| `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (MWRR/TWRR) |
+| `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (alias to `stats --positions --summary`) |
 | `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
@@ -59,9 +59,25 @@ workspace-finance/
 - `--update-prices {auto,always,never}`: Controls when to fetch latest stock/fund prices from Avanza API
 - `--update-all`: Update prices for all assets in the database, held or not
 - `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
-- `--start-date DATE --end-date DATE`: Calculate returns over a specific date range
+- `--cohorts-start DATE --cohorts-end DATE`: Filter which deposit cohorts are displayed
+- `--value-start DATE --value-end DATE`: Set the performance valuation window (double snapshot)
+- `--start DATE --end DATE` / `--start-date DATE --end-date DATE`: Shorthand that sets both cohorts and value windows to same dates
+- `--positions`, `-p`: Show positions holdings breakdown under each cohort (or summary)
+- `--summary`, `-s`: Consolidate cohort statistics into a single overview block
 - `--apy-mode {mwrr,twrr}`: APY calculation method (`mwrr` uses Modified Dietz; `twrr` uses Time-Weighted)
 - `--format {table,json}`: Output formatting (default: `table`)
+- `--quiet`, `-q`: Suppress price data staleness warnings
+
+### Guidelines: When to use what date boundaries
+1. **To see how cohorts from a certain period look today:**
+   Use `--cohorts-start YYYY-MM` / `--cohorts-end YYYY-MM`
+   *Example:* `python scripts/cli.py stats --cohorts-start 2024-01`
+2. **To see all cohorts' performance over a specific valuation window:**
+   Use `--value-start YYYY-MM` / `--value-end YYYY-MM` (or `--as-of YYYY-MM`)
+   *Example:* `python scripts/cli.py stats --value-start 2024-01 --value-end 2024-12`
+3. **To see cohorts created in a period AND their performance during that same period:**
+   Use `--start YYYY-MM` / `--end YYYY-MM`
+   *Example:* `python scripts/cli.py stats --start 2024-01 --end 2024-12`
 
 ### Settings Subcommands
 - `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)

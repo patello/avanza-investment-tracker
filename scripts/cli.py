@@ -9,8 +9,9 @@ price updates, and statistics calculation.
 import argparse
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
+import os
 from database_handler import DatabaseHandler
 from data_parser import DataParser, SpecialCases
 from calculate_stats import StatCalculator
@@ -246,32 +247,177 @@ def check_price_staleness(asset_name, price_date_str, target_date, warnings_list
         pass
 
 
-def stats(args):
+def calc_period_apy(start_val, end_val, period_dep, period_with, days, apy_mode):
+    if days <= 0:
+        return 0.0
+    if apy_mode == 'twrr':
+        if start_val > 1e-4 and end_val > 0:
+            tr = end_val / start_val
+            return 100 * (tr ** (365.0 / days) - 1)
+        return 0.0
+    else:
+        # MWRR / Modified Dietz approximation
+        weighted_base = start_val + 0.5 * period_dep - 0.5 * period_with
+        gain = end_val - start_val - (period_dep - period_with)
+        if weighted_base > 1e-4:
+            hpr = gain / weighted_base
+            return 100 * hpr * (365.0 / days)
+        return 0.0
 
+
+def get_stats_holdings(db, cohort_month=None, cohorts_start=None, cohorts_end=None, accounts=None):
+    cur = db.get_cursor()
+    
+    # Resolve accounts
+    if accounts is None:
+        cur.execute("SELECT DISTINCT account FROM cohort_assets")
+        accounts = [r[0] for r in cur.fetchall()]
+        
+    if not accounts:
+        return []
+        
+    placeholders = ",".join("?" for _ in accounts)
+    params = list(accounts)
+    
+    query = f"""
+        SELECT a.asset, SUM(ca.amount) AS total_amount, a.latest_price, a.latest_price_date
+        FROM cohort_assets ca
+        JOIN assets a ON ca.asset_id = a.asset_id
+        WHERE ca.account IN ({placeholders}) AND ca.amount > 0.0001
+    """
+    
+    if cohort_month is not None:
+        query += " AND ca.month = ?"
+        params.append(cohort_month.isoformat() if hasattr(cohort_month, 'isoformat') else str(cohort_month))
+    else:
+        if cohorts_start is not None:
+            query += " AND ca.month >= ?"
+            params.append(cohorts_start.isoformat() if hasattr(cohorts_start, 'isoformat') else str(cohorts_start))
+        if cohorts_end is not None:
+            query += " AND ca.month <= ?"
+            params.append(cohorts_end.isoformat() if hasattr(cohorts_end, 'isoformat') else str(cohorts_end))
+            
+    query += " GROUP BY a.asset HAVING SUM(ca.amount) > 0.0001 ORDER BY (SUM(ca.amount) * COALESCE(a.latest_price, 0.0)) DESC"
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    
+    holdings = []
+    for asset, amount, price, price_date in rows:
+        p_val = price if price is not None else 0.0
+        holdings.append({
+            'asset': asset,
+            'amount': amount,
+            'price': p_val,
+            'market_value': amount * p_val,
+            'price_date': price_date
+        })
+    return holdings
+
+
+def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warnings):
+    import shutil
+    import os
+    import time
+    
+    # We must ensure target_date is a date object
+    if isinstance(target_date, str):
+        from datetime import datetime
+        t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+    else:
+        t_date = target_date
+        
+    temp_db_path = f"{db.db_file}_temp_as_of_{int(time.time())}_{id(target_date)}.db"
+    shutil.copy2(db.db_file, temp_db_path)
+    
+    temp_db = DatabaseHandler(temp_db_path)
+    temp_db.connect()
+    
+    temp_cur = temp_db.get_cursor()
+    temp_cur.execute("DELETE FROM transactions WHERE date > ?", (t_date.isoformat(),))
+    
+    temp_db.reset_table("cohort_data")
+    temp_db.reset_table("cohort_assets")
+    temp_db.reset_table("cohort_cash_flows")
+    temp_db.reset_table("assets")
+    temp_cur.execute("UPDATE transactions SET processed = 0")
+    temp_db.commit()
+    
+    special_cases = SpecialCases(special_cases_path) if special_cases_path else None
+    parser = DataParser(temp_db, special_cases)
+    parser.process_transactions()
+    
+    # Resolve prices
+    assets = temp_cur.execute("SELECT asset_id, asset FROM assets").fetchall()
+    for asset_id, asset_name in assets:
+        price_row = temp_cur.execute("""
+            SELECT price, price_date FROM asset_prices
+            WHERE asset_id = ? AND price_date <= ?
+            ORDER BY price_date DESC LIMIT 1
+        """, (asset_id, t_date.isoformat())).fetchone()
+        if price_row:
+            temp_cur.execute("""
+                UPDATE assets
+                SET latest_price = ?, latest_price_date = ?
+                WHERE asset_id = ?
+            """, (price_row[0], price_row[1], asset_id))
+            check_price_staleness(asset_name, price_row[1], t_date, warnings)
+    temp_db.commit()
+    
+    stat_calc = StatCalculator(temp_db)
+    stat_calc.calculate_cohort_stats(apy_mode=apy_mode, today=t_date)
+    stat_calc.calculate_year_stats(apy_mode=apy_mode, today=t_date)
+    
+    return temp_db, temp_db_path
+
+
+def stats(args):
     """Smart statistics command with automatic updates."""
     db = get_db(args)
     
     # Parse account filter
     accounts = resolve_accounts(db, args.account)
     
-    # Parse as_of, start_date, end_date
     as_of = None
-    start_date = None
-    end_date = None
+    cohorts_start = None
+    cohorts_end = None
+    value_start = None
+    value_end = None
     
     try:
         as_of = parse_date_bound(getattr(args, 'as_of', None), is_start_bound=False)
-        start_date = parse_date_bound(getattr(args, 'start_date', None), is_start_bound=True)
-        end_date = parse_date_bound(getattr(args, 'end_date', None), is_start_bound=False)
         
-        # If both are specified, start_date and end_date/as_of work together
-        if as_of is not None and end_date is None:
-            end_date = as_of
+        c_start_raw = getattr(args, 'cohorts_start', None)
+        c_end_raw = getattr(args, 'cohorts_end', None)
+        v_start_raw = getattr(args, 'value_start', None)
+        v_end_raw = getattr(args, 'value_end', None)
+        start_raw = getattr(args, 'start', None)
+        end_raw = getattr(args, 'end', None)
+        
+        # Fallbacks
+        if c_start_raw is None:
+            c_start_raw = start_raw
+        if v_start_raw is None:
+            v_start_raw = start_raw
+            
+        if c_end_raw is None:
+            c_end_raw = end_raw
+        if v_end_raw is None:
+            v_end_raw = end_raw
+            
+        if v_end_raw is None and as_of is not None:
+            v_end_raw = getattr(args, 'as_of', None)
+            
+        cohorts_start = parse_date_bound(c_start_raw, is_start_bound=True)
+        cohorts_end = parse_date_bound(c_end_raw, is_start_bound=False)
+        value_start = parse_date_bound(v_start_raw, is_start_bound=True)
+        value_end = parse_date_bound(v_end_raw, is_start_bound=False)
+        
     except ValueError as e:
         logging.error(str(e))
         return 1
 
-    has_date_filters = (as_of is not None or start_date is not None or end_date is not None)
+    # Date filters trigger temp DB snapshotting
+    has_date_filters = (as_of is not None or value_start is not None or value_end is not None)
 
     # Update prices if needed (only if not running past historical query or if force)
     update_all = getattr(args, 'update_all', False)
@@ -346,71 +492,29 @@ def stats(args):
             return 1
     
     # Display statistics
-    temp_db = None
-    temp_db_path = None
+    start_temp_db = None
+    start_temp_db_path = None
+    end_temp_db = None
+    end_temp_db_path = None
+    
     try:
-        if has_date_filters:
-            import shutil
-            import os
-            import time
+        # Determine effective end target date
+        target_end_date = value_end if value_end is not None else as_of
+        if target_end_date is None and (value_start is not None or cohorts_start is not None or cohorts_end is not None):
+            target_end_date = date.today()
             
-            # Determine target_date: the end bound of calculations
-            target_date = end_date if end_date is not None else as_of
-            if target_date is None:
-                target_date = datetime.today().date()
-                
-            temp_db_path = f"{db.db_file}_temp_as_of_{int(time.time())}.db"
-            shutil.copy2(db.db_file, temp_db_path)
-            
-            temp_db = DatabaseHandler(temp_db_path)
-            temp_db.connect()
-            
-            # Delete transactions after target_date
-            temp_cur = temp_db.get_cursor()
-            temp_cur.execute("DELETE FROM transactions WHERE date > ?", (target_date.isoformat(),))
-            
-            # Reset tables
-            temp_db.reset_table("cohort_data")
-            temp_db.reset_table("cohort_assets")
-            temp_db.reset_table("cohort_cash_flows")
-            temp_db.reset_table("assets")
-            temp_cur.execute("UPDATE transactions SET processed = 0")
-            temp_db.commit()
-            
-            # Run parser
-            special_cases = SpecialCases(args.special_cases) if getattr(args, 'special_cases', None) else None
-            parser = DataParser(temp_db, special_cases)
-            parser.process_transactions()
-            
-            # Resolve prices as of target_date
-            assets = temp_cur.execute("SELECT asset_id, asset FROM assets").fetchall()
-            warnings = []
-            for asset_id, asset_name in assets:
-                price_row = temp_cur.execute("""
-                    SELECT price, price_date FROM asset_prices
-                    WHERE asset_id = ? AND price_date <= ?
-                    ORDER BY price_date DESC LIMIT 1
-                """, (asset_id, target_date.isoformat())).fetchone()
-                if price_row:
-                    temp_cur.execute("""
-                        UPDATE assets
-                        SET latest_price = ?, latest_price_date = ?
-                        WHERE asset_id = ?
-                    """, (price_row[0], price_row[1], asset_id))
-                    check_price_staleness(asset_name, price_row[1], target_date, warnings)
-            temp_db.commit()
-            
-            if warnings and not getattr(args, 'quiet', False):
-                for warning in warnings:
-                    print(warning, file=sys.stderr)
-            
-            # Calculate stats dynamically
-            stat_calc = StatCalculator(temp_db)
-            stat_calc.calculate_cohort_stats(apy_mode=apy_mode, today=target_date)
-            stat_calc.calculate_year_stats(apy_mode=apy_mode, today=target_date)
-            
-            active_db = temp_db
+        warnings = []
+        if value_start is not None:
+            # Double snapshot calculation
+            start_temp_db, start_temp_db_path = create_temp_snapshot_db(db, value_start, apy_mode, getattr(args, 'special_cases', None), warnings)
+            end_temp_db, end_temp_db_path = create_temp_snapshot_db(db, target_end_date, apy_mode, getattr(args, 'special_cases', None), warnings)
+            active_db = end_temp_db
+        elif target_end_date is not None:
+            # Single snapshot calculation
+            end_temp_db, end_temp_db_path = create_temp_snapshot_db(db, target_end_date, apy_mode, getattr(args, 'special_cases', None), warnings)
+            active_db = end_temp_db
         else:
+            # Main database
             active_db = db
             
         stat_calc = StatCalculator(active_db)
@@ -421,72 +525,288 @@ def stats(args):
         kwargs = {
             'period': period,
             'deposits': args.deposits,
-            'apy_mode': apy_mode,
-            'start_date': start_date,
-            'end_date': end_date
+            'apy_mode': apy_mode
         }
         
         # Add account filter if specified
         if accounts is not None:
             kwargs['accounts'] = accounts
-        
-        if getattr(args, 'format', 'table') == 'json':
-            import json
-            def serialize_date(d):
+            
+        # Get start/end maps for delta calculation
+        start_map = {}
+        if value_start is not None:
+            start_calc = StatCalculator(start_temp_db)
+            start_stats = start_calc.get_stats(**kwargs)
+            
+            def get_key(d):
                 if hasattr(d, 'isoformat'):
                     return d.isoformat()
                 return str(d)
                 
-            if args.accumulated:
-                acc_stats = stat_calc.get_accumulated(**kwargs)
-                json_data = []
-                for (date_val, acc_net_deposit, acc_value, acc_gainloss) in acc_stats:
-                    json_data.append({
-                        'date': serialize_date(date_val),
-                        'deposit': acc_net_deposit,
-                        'value': acc_value,
-                        'gain_loss': acc_gainloss
-                    })
-                print(json.dumps(json_data, indent=2))
-            else:
-                stats_list = stat_calc.get_stats(**kwargs)
-                json_data = []
-                for (date_val, deposit, withdrawal, value, total_gainloss, realized_gainloss, unrealized_gainloss, total_gainloss_per, realized_gainloss_per, unrealized_gainloss_per, annual_per_yield) in stats_list:
-                    if deposit > 0:
-                        json_data.append({
-                            'date': serialize_date(date_val),
-                            'deposit': deposit,
-                            'withdrawal': withdrawal,
-                            'value': value,
-                            'total_gainloss': total_gainloss,
-                            'total_gainloss_percent': total_gainloss_per,
-                            'realized_gainloss': realized_gainloss,
-                            'realized_gainloss_percent': realized_gainloss_per,
-                            'unrealized_gainloss': unrealized_gainloss,
-                            'unrealized_gainloss_percent': unrealized_gainloss_per,
-                            'apy': annual_per_yield
-                        })
-                print(json.dumps(json_data, indent=2))
+            start_map = { get_key(r[0]): r for r in start_stats }
+            
+            end_calc = StatCalculator(end_temp_db)
+            end_stats = end_calc.get_stats(**kwargs)
+            
+            stats_list = []
+            days = (target_end_date - value_start).days
+            for end_row in end_stats:
+                date_key = get_key(end_row[0])
+                if date_key in start_map:
+                    start_row = start_map[date_key]
+                    
+                    p_dep = end_row[1] - start_row[1]
+                    p_with = end_row[2] - start_row[2]
+                    p_val = end_row[3]
+                    p_gain = end_row[4] - start_row[4]
+                    p_real = end_row[5] - start_row[5]
+                    p_unreal = end_row[6] - start_row[6]
+                    
+                    base_cap = start_row[3] + p_dep
+                    if base_cap > 1e-4:
+                        p_gain_pct = 100.0 * p_gain / base_cap
+                        p_real_pct = 100.0 * p_real / base_cap
+                        p_unreal_pct = 100.0 * p_unreal / base_cap
+                    else:
+                        p_gain_pct = p_real_pct = p_unreal_pct = 0.0
+                        
+                    p_apy = calc_period_apy(start_row[3], p_val, p_dep, p_with, days, apy_mode)
+                    
+                    stats_list.append((
+                        end_row[0], p_dep, p_with, p_val, p_gain, p_real, p_unreal,
+                        p_gain_pct, p_real_pct, p_unreal_pct, p_apy
+                    ))
+                else:
+                    # Cohort didn't exist at value_start
+                    stats_list.append(end_row)
         else:
-            if args.accumulated:
-                stat_calc.print_accumulated(**kwargs)
+            stats_list = stat_calc.get_stats(**kwargs)
+            
+        # Filter by deposits parameter for double snapshot
+        if value_start is not None and args.deposits == "current":
+            stats_list = [row for row in stats_list if row[3] > 0 or (get_key(row[0]) in start_map and start_map[get_key(row[0])][3] > 0)]
+
+        # Apply cohorts range filtering
+        filtered_stats = []
+        for row in stats_list:
+            row_date = row[0]
+            if isinstance(row_date, str):
+                if '-' in row_date:
+                    rd = datetime.strptime(row_date, "%Y-%m-%d").date()
+                else:
+                    rd = date(int(row_date), 12, 31)
             else:
-                stat_calc.print_stats(**kwargs)
+                rd = row_date
+                
+            if cohorts_start is not None and rd < cohorts_start:
+                continue
+            if cohorts_end is not None and rd > cohorts_end:
+                continue
+            filtered_stats.append(row)
+        stats_list = filtered_stats
+        
+        # Output summary mode or standard list mode
+        if getattr(args, 'summary', False):
+            total_dep = sum(row[1] for row in stats_list)
+            total_with = sum(row[2] for row in stats_list)
+            total_val = sum(row[3] for row in stats_list)
+            total_gain = sum(row[4] for row in stats_list)
+            total_real = sum(row[5] for row in stats_list)
+            total_unreal = sum(row[6] for row in stats_list)
+            
+            start_val = 0.0
+            if value_start is not None:
+                start_val = sum(start_map[get_key(row[0])][3] for row in stats_list if get_key(row[0]) in start_map)
+                days = (target_end_date - value_start).days
+                blended_apy = calc_period_apy(start_val, total_val, total_dep, total_with, days, apy_mode)
+            else:
+                acc_list = accounts if accounts is not None else 'all'
+                blended_apy, _ = stat_calc.calculate_account_apy(acc_list, apy_mode=apy_mode, end_date=target_end_date, current_value=total_val)
+                
+            holdings = []
+            if getattr(args, 'positions', False):
+                holdings = get_stats_holdings(active_db, cohorts_start=cohorts_start, cohorts_end=cohorts_end, accounts=accounts)
+                for h in holdings:
+                    check_price_staleness(h['asset'], h['price_date'], target_end_date or date.today(), warnings)
+                    
+            if getattr(args, 'format', 'table') == 'json':
+                import json
+                result = {
+                    'period': f"{value_start.isoformat()} to {target_end_date.isoformat()}" if value_start else "all",
+                    'deposits': total_dep,
+                    'withdrawals': total_with,
+                    'current_value': total_val,
+                    'total_gain': total_gain,
+                    'total_gain_percent': (total_gain / (start_val + total_dep) * 100) if ((start_val + total_dep) > 0) else 0.0,
+                    'apy': blended_apy
+                }
+                if accounts is not None and len(accounts) == 1:
+                    acc_id = list(accounts)[0]
+                    nicknames = db.get_all_account_nicknames()
+                    result['account'] = acc_id
+                    result['display_name'] = nicknames.get(acc_id, acc_id)
+                if getattr(args, 'positions', False):
+                    total_assets_val = sum(h['market_value'] for h in holdings)
+                    result['holdings'] = [
+                        {
+                            'asset': h['asset'],
+                            'amount': h['amount'],
+                            'price': h['price'],
+                            'market_value': h['market_value'],
+                            'allocation_percent': (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                        }
+                        for h in holdings
+                    ]
+                print(json.dumps(result, indent=2))
+            else:
+                is_portfolio = getattr(args, 'is_portfolio', False)
+                if is_portfolio and accounts is not None and len(accounts) == 1:
+                    account_id = list(accounts)[0]
+                    nicknames = db.get_all_account_nicknames()
+                    nickname = nicknames.get(account_id)
+                    account_label = f"Account {account_id}"
+                    if nickname:
+                        account_label += f" ({nickname})"
+                else:
+                    account_label = None
+                    
+                period_label = f"{value_start.isoformat()} to {target_end_date.isoformat()}" if value_start else "all cohorts"
+                if account_label:
+                    header_title = f"{account_label} — {period_label}" if value_start else account_label
+                else:
+                    header_title = f"Summary — {period_label}"
+                print(f"{header_title}\n")
+                print(f"Total Deposited:   {total_dep:,.0f} SEK")
+                print(f"Current Value:     {total_val:,.0f} SEK")
+                
+                gl_sign = "+" if total_gain > 0 else ""
+                gain_pct = (total_gain / (start_val + total_dep) * 100) if ((start_val + total_dep) > 0) else 0.0
+                gl_pct_sign = "+" if gain_pct > 0 else ""
+                print(f"Total Gain:       {gl_sign}{total_gain:,.0f} SEK ({gl_pct_sign}{gain_pct:.1f}%)")
+                
+                apy_str = f"{blended_apy:.1f}%" if blended_apy is not None else "N/A"
+                print(f"Blended APY:       {apy_str} ({apy_mode.upper()})")
+                
+                if getattr(args, 'positions', False):
+                    print()
+                    print("Holdings:")
+                    if holdings:
+                        name_w = max(max(len(h['asset']) for h in holdings), 9)
+                        print(f"  {'Fund Name':<{name_w}} {'Market Value':>15} {'Allocation':>11}")
+                        total_assets_val = sum(h['market_value'] for h in holdings)
+                        for h in holdings:
+                            alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                            print(f"  {h['asset']:<{name_w}} {h['market_value']:>15,.0f} SEK {alloc:>10.1f}%")
+                        print(f"  {'Total':<{name_w}} {total_assets_val:>15,.0f} SEK {'100.0%':>11}")
+                    else:
+                        print("  None")
+        else:
+            # Cohort-level breakdown mode
+            if getattr(args, 'format', 'table') == 'json':
+                import json
+                def serialize_date(d):
+                    if hasattr(d, 'isoformat'):
+                        return d.isoformat()
+                    return str(d)
+                json_data = []
+                for row in stats_list:
+                    if row[1] > 0 or row[3] > 0:
+                        cohort_month = row[0]
+                        cohort_data = {
+                            'date': serialize_date(cohort_month),
+                            'deposit': row[1],
+                            'withdrawal': row[2],
+                            'value': row[3],
+                            'total_gainloss': row[4],
+                            'total_gainloss_percent': row[7],
+                            'realized_gainloss': row[5],
+                            'realized_gainloss_percent': row[8],
+                            'unrealized_gainloss': row[6],
+                            'unrealized_gainloss_percent': row[9],
+                            'apy': row[10]
+                        }
+                        if getattr(args, 'positions', False):
+                            cohort_holdings = get_stats_holdings(active_db, cohort_month=cohort_month, accounts=accounts)
+                            for h in cohort_holdings:
+                                check_price_staleness(h['asset'], h['price_date'], target_end_date or date.today(), warnings)
+                            total_assets_val = sum(h['market_value'] for h in cohort_holdings)
+                            cohort_data['holdings'] = [
+                                {
+                                    'asset': h['asset'],
+                                    'amount': h['amount'],
+                                    'price': h['price'],
+                                    'market_value': h['market_value'],
+                                    'allocation_percent': (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                                }
+                                for h in cohort_holdings
+                            ]
+                        json_data.append(cohort_data)
+                print(json.dumps(json_data, indent=2))
+            else:
+                for row in stats_list:
+                    if row[1] > 0 or row[3] > 0:
+                        cohort_month = row[0]
+                        if hasattr(cohort_month, 'year'):
+                            if period == "year":
+                                display_date = cohort_month.year
+                            else:
+                                display_date = cohort_month.strftime("%b %Y")
+                        else:
+                            display_date = str(cohort_month)
+                            
+                        print(display_date)
+                        print(f"Deposited: {row[1]:.0f}")
+                        print(f"Value: {row[3]:.0f}")
+                        print(f"Withdrawal: {row[2]:.0f}")
+                        gl_sign = "+" if row[4] > 0 else ""
+                        gl_pct_sign = "+" if row[7] > 0 else ""
+                        print(f"Gain/Loss: {gl_sign}{row[4]:.0f} ({gl_pct_sign}{row[7]:.1f}%)")
+                        un_sign = "+" if row[6] > 0 else ""
+                        un_pct_sign = "+" if row[9] > 0 else ""
+                        print(f"- Unrealized: {un_sign}{row[6]:.0f} ({un_pct_sign}{row[9]:.1f}%)")
+                        re_sign = "+" if row[5] > 0 else ""
+                        re_pct_sign = "+" if row[8] > 0 else ""
+                        print(f"- Realized: {re_sign}{row[5]:.0f} ({re_pct_sign}{row[8]:.1f}%)")
+                        apy_str = f"{row[10]:.1f}%" if row[10] is not None else "N/A"
+                        print(f"APY: {apy_str}")
+                        
+                        if getattr(args, 'positions', False):
+                            cohort_holdings = get_stats_holdings(active_db, cohort_month=cohort_month, accounts=accounts)
+                            for h in cohort_holdings:
+                                check_price_staleness(h['asset'], h['price_date'], target_end_date or date.today(), warnings)
+                            if cohort_holdings:
+                                print("  Holdings:")
+                                name_w = max(max(len(h['asset']) for h in cohort_holdings), 9)
+                                print(f"    {'Fund Name':<{name_w}} {'Market Value':>15} {'Allocation':>11}")
+                                total_assets_val = sum(h['market_value'] for h in cohort_holdings)
+                                for h in cohort_holdings:
+                                    alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
+                                    print(f"    {h['asset']:<{name_w}} {h['market_value']:>15,.0f} SEK {alloc:>10.1f}%")
+                            else:
+                                print("  Holdings: None")
+                        print()
+                        
+        if warnings and not getattr(args, 'quiet', False):
+            import sys
+            for warning in warnings:
+                print(warning, file=sys.stderr)
+                
         return 0
         
     except Exception as e:
         logging.error(f"Failed to show statistics: {e}")
         return 1
     finally:
-        if temp_db is not None:
-            temp_db.disconnect()
-            import gc
-            gc.collect()
-            if temp_db_path and os.path.exists(temp_db_path):
-                try:
-                    os.remove(temp_db_path)
-                except Exception as e:
-                    logging.warning(f"Failed to remove temp db file: {e}")
+        for t_db, t_path in [(start_temp_db, start_temp_db_path), (end_temp_db, end_temp_db_path)]:
+            if t_db is not None:
+                t_db.disconnect()
+                import gc
+                gc.collect()
+                if t_path and os.path.exists(t_path):
+                    try:
+                        os.remove(t_path)
+                    except Exception as e:
+                        logging.warning(f"Failed to remove temp db file: {e}")
 
 
 def status(args):
@@ -714,467 +1034,40 @@ def accounts_summary(args):
         logging.error(f"Failed to show account summary: {e}")
         return 1
 
+    return 0
+
 
 def portfolio(args):
-    """Show portfolio snapshot or change over a period."""
-    db = get_db(args)
-    cur = db.get_cursor()
-    warnings = []
-    
-    # Parse dates
-    as_of = None
-    start_date = None
-    end_date = None
-    
-    try:
-        as_of = parse_date_bound(getattr(args, 'as_of', None), is_start_bound=False)
-        start_date = parse_date_bound(getattr(args, 'start_date', None), is_start_bound=True)
-        end_date = parse_date_bound(getattr(args, 'end_date', None), is_start_bound=False)
+    """Show portfolio snapshot as an alias to stats --positions --summary."""
+    fmt = getattr(args, 'format', 'table')
+    if fmt not in ('table', 'json'):
+        fmt = 'table'
         
-        if as_of is not None and end_date is None:
-            end_date = as_of
-    except ValueError as e:
-        logging.error(str(e))
-        return 1
-            
-    # Parse account filter
-    accounts = resolve_accounts(db, args.account)
-        
-    # Get all distinct accounts from transactions up to end_date (or all time if end_date is None)
-    if accounts is None:
-        query = "SELECT DISTINCT account FROM transactions"
-        params = []
-        if end_date:
-            query += " WHERE date <= ?"
-            params.append(end_date)
-        query += " ORDER BY account"
-        accounts = [row[0] for row in cur.execute(query, params).fetchall()]
-        
-    nicknames = db.get_all_account_nicknames()
-    
-    def get_display_name(account):
-        return nicknames.get(account, account)
-        
-    def get_snapshot(as_of_date):
-        summaries = {}
-        for account in accounts:
-            # 1. Cash balance
-            cash_query = "SELECT SUM(total) FROM transactions WHERE account = ?"
-            cash_params = [account]
-            if as_of_date:
-                cash_query += " AND date <= ?"
-                cash_params.append(as_of_date)
-                
-            cur.execute(cash_query, cash_params)
-            cash_row = cur.fetchone()
-            cash = cash_row[0] if cash_row and cash_row[0] is not None else 0.0
-            
-            # 2. Asset holdings
-            holdings_query = """
-                SELECT asset_name, SUM(amount)
-                FROM transactions
-                WHERE account = ? AND transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
-            """
-            holdings_params = [account]
-            if as_of_date:
-                holdings_query += " AND date <= ?"
-                holdings_params.append(as_of_date)
-            holdings_query += " GROUP BY asset_name HAVING ABS(SUM(amount)) > 0.0001"
-            
-            cur.execute(holdings_query, holdings_params)
-            holdings = cur.fetchall()
-            
-            assets_value = 0.0
-            for asset_name, amt in holdings:
-                price_date = None
-                if as_of_date:
-                    price_query = """
-                        SELECT ap.price, ap.price_date FROM asset_prices ap
-                        JOIN assets a ON ap.asset_id = a.asset_id
-                        WHERE a.asset = ? AND ap.price_date <= ?
-                        ORDER BY ap.price_date DESC LIMIT 1
-                    """
-                    cur.execute(price_query, (asset_name, as_of_date))
-                    p_row = cur.fetchone()
-                    if p_row:
-                        price = p_row[0]
-                        price_date = p_row[1]
-                    else:
-                        cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
-                        fallback_row = cur.fetchone()
-                        price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
-                        price_date = fallback_row[1] if fallback_row and len(fallback_row) > 1 else None
-                else:
-                    cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
-                    p_row = cur.fetchone()
-                    price = p_row[0] if p_row and p_row[0] is not None else 0.0
-                    price_date = p_row[1] if p_row and len(p_row) > 1 else None
-                    
-                assets_value += amt * price
-                val_date = as_of_date if as_of_date is not None else datetime.today().date()
-                check_price_staleness(asset_name, price_date, val_date, warnings)
-                
-            summaries[account] = {
-                'cash': cash,
-                'assets': assets_value,
-                'total': cash + assets_value
-            }
-        return summaries
-
-    def get_account_holdings(account, as_of_date):
-        holdings = []
-        if as_of_date is None:
-            # Query cohort_assets for current holdings
-            query = """
-                SELECT a.asset, SUM(ca.amount) AS held_amount, a.latest_price, a.latest_price_date
-                FROM cohort_assets ca
-                JOIN assets a ON ca.asset_id = a.asset_id
-                WHERE ca.account = ?
-                GROUP BY a.asset
-                HAVING SUM(ca.amount) > 0.0001
-                ORDER BY (SUM(ca.amount) * COALESCE(a.latest_price, 0.0)) DESC
-            """
-            cur.execute(query, (account,))
-            rows = cur.fetchall()
-            for asset_name, amt, price, price_date in rows:
-                price_val = price if price is not None else 0.0
-                holdings.append({
-                    'asset': asset_name,
-                    'amount': amt,
-                    'price': price_val,
-                    'market_value': amt * price_val
-                })
-                check_price_staleness(asset_name, price_date, datetime.today().date(), warnings)
-        else:
-            # Past holdings from transactions
-            query = """
-                SELECT asset_name, SUM(amount) AS held_amount
-                FROM transactions
-                WHERE account = ? AND transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
-                  AND date <= ?
-                GROUP BY asset_name
-                HAVING ABS(SUM(amount)) > 0.0001
-            """
-            cur.execute(query, (account, as_of_date.isoformat() if hasattr(as_of_date, 'isoformat') else as_of_date))
-            rows = cur.fetchall()
-            for asset_name, amt in rows:
-                # Get price as of as_of_date
-                price_query = """
-                    SELECT ap.price, ap.price_date FROM asset_prices ap
-                    JOIN assets a ON ap.asset_id = a.asset_id
-                    WHERE a.asset = ? AND ap.price_date <= ?
-                    ORDER BY ap.price_date DESC LIMIT 1
-                """
-                cur.execute(price_query, (asset_name, as_of_date))
-                p_row = cur.fetchone()
-                if p_row:
-                    price = p_row[0]
-                    price_date = p_row[1]
-                else:
-                    cur.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset = ?", (asset_name,))
-                    fallback_row = cur.fetchone()
-                    price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
-                    price_date = fallback_row[1] if fallback_row and len(fallback_row) > 1 else None
-                
-                holdings.append({
-                    'asset': asset_name,
-                    'amount': amt,
-                    'price': price,
-                    'market_value': amt * price
-                })
-                check_price_staleness(asset_name, price_date, as_of_date, warnings)
-            
-            # Sort by market value descending
-            holdings.sort(key=lambda x: x['market_value'], reverse=True)
-            
-        return holdings
-
-    if start_date is not None:
-        # Comparison mode: show change from start_date to end_date (pure market return)
-        start_vals = get_snapshot(start_date)
-        end_vals = get_snapshot(end_date)
-        
-        comparison = []
-        for account in accounts:
-            s_val = start_vals[account]['total']
-            e_val = end_vals[account]['total']
-            
-            # Query net deposits using external capital flows SQL view
-            cur.execute("""
-                SELECT COALESCE(SUM(flow_amount), 0) FROM v_external_capital_flows
-                WHERE account = ? AND date > ? AND date <= ?
-            """, (account, start_date.isoformat() if hasattr(start_date, 'isoformat') else start_date, end_date.isoformat() if hasattr(end_date, 'isoformat') else end_date))
-            net_dep = cur.fetchone()[0]
-            ret_sek = e_val - s_val - net_dep
-            ret_pct = (ret_sek / s_val * 100) if s_val > 0 else 0.0
-            total_change = e_val - s_val
-            
-            comparison.append({
-                'account': account,
-                'display_name': get_display_name(account),
-                'start_value': s_val,
-                'end_value': e_val,
-                'net_deposits': net_dep,
-                'return_sek': ret_sek,
-                'return_percent': ret_pct,
-                'total_change': total_change
-            })
-            
-        if args.format == 'json':
-            import json
-            print(json.dumps(comparison, indent=2))
-        else:
-            if not comparison:
-                print("No portfolio data found")
-                return 0
-                
-            total_start = sum(c['start_value'] for c in comparison)
-            total_end = sum(c['end_value'] for c in comparison)
-            total_net_deposits = sum(c['net_deposits'] for c in comparison)
-            total_return_sek = total_end - total_start - total_net_deposits
-            total_return_pct = (total_return_sek / total_start * 100) if total_start > 0 else 0.0
-            total_change_sek = total_end - total_start
-            
-            name_width = max(max(len(c['display_name']) for c in comparison), 7)
-            header = f"{'Account':<{name_width}} {'Start Value':>12} {'End Value':>12} {'Net Deposits':>14} {'Return':>14} {'Return (%)':>12} {'Total Change':>14}"
-            print(header)
-            print("-" * len(header))
-            
-            for c in comparison:
-                dep_sign = "+" if c['net_deposits'] > 0 else ""
-                ret_sign = "+" if c['return_sek'] > 0 else ""
-                pct_sign = "+" if c['return_percent'] > 0 else ""
-                chg_sign = "+" if c['total_change'] > 0 else ""
-                
-                dep_str = f"{dep_sign}{c['net_deposits']:,.0f}" if c['net_deposits'] != 0 else "0"
-                ret_str = f"{ret_sign}{c['return_sek']:,.0f}"
-                pct_str = f"{pct_sign}{c['return_percent']:.1f}%"
-                chg_str = f"{chg_sign}{c['total_change']:,.0f}"
-                
-                print(f"{c['display_name']:<{name_width}} {c['start_value']:>12.0f} {c['end_value']:>12.0f} {dep_str:>14} {ret_str:>14} {pct_str:>12} {chg_str:>14}")
-                
-            print("-" * len(header))
-            total_dep_sign = "+" if total_net_deposits > 0 else ""
-            total_ret_sign = "+" if total_return_sek > 0 else ""
-            total_pct_sign = "+" if total_return_pct > 0 else ""
-            total_chg_sign = "+" if total_change_sek > 0 else ""
-            
-            total_dep_str = f"{total_dep_sign}{total_net_deposits:,.0f}" if total_net_deposits != 0 else "0"
-            total_ret_str = f"{total_ret_sign}{total_return_sek:,.0f}"
-            total_pct_str = f"{total_pct_sign}{total_return_pct:.1f}%"
-            total_chg_str = f"{total_chg_sign}{total_change_sek:,.0f}"
-            
-    else:
-        # Single snapshot mode
-        vals = get_snapshot(end_date)
-        
-        # Calculate APY mode
-        apy_mode = getattr(args, 'apy_mode', 'mwrr')
-        mode_label = 'MWRR' if apy_mode == 'mwrr' else 'TWRR'
-        
-        # If we have a single account, show the detailed summary layout
-        if len(accounts) == 1:
-            account = accounts[0]
-            nickname = nicknames.get(account, account)
-            
-            # Fetch cash flows totals
-            cur.execute("""
-                SELECT 
-                    COALESCE(SUM(CASE WHEN flow_amount > 0 THEN flow_amount ELSE 0 END), 0) AS deposits,
-                    COALESCE(SUM(CASE WHEN flow_amount < 0 THEN flow_amount ELSE 0 END), 0) AS withdrawals
-                FROM v_external_capital_flows
-                WHERE account = ?
-            """, (account,))
-            cf_row = cur.fetchone()
-            deposits = cf_row[0] if cf_row else 0.0
-            withdrawals = cf_row[1] if cf_row else 0.0
-            net_invested = deposits + withdrawals # withdrawals is negative
-            
-            # Current value (cash + assets)
-            cash = vals[account]['cash']
-            assets = vals[account]['assets']
-            current_value = cash + assets
-            
-            # Fetch gain/loss from account_cohort_stats
-            cur.execute("""
-                SELECT acc_total_gainloss FROM account_cohort_stats
-                WHERE account = ?
-                ORDER BY month DESC LIMIT 1
-            """, (account,))
-            gl_row = cur.fetchone()
-            total_gainloss = gl_row[0] if gl_row and gl_row[0] is not None else (current_value - net_invested)
-            
-            gainloss_pct = (total_gainloss / deposits * 100) if deposits > 0 else 0.0
-            
-            # Calculate APY
-            stat_calc = StatCalculator(db)
-            apy, total_days = stat_calc.calculate_account_apy(account, apy_mode=apy_mode, end_date=end_date, current_value=current_value)
-            
-            # Fetch holdings scoped to this account
-            holdings = get_account_holdings(account, end_date)
-            total_assets_val = sum(h['market_value'] for h in holdings)
-            
-            if args.format == 'json':
-                import json
-                holdings_json = []
-                for h in holdings:
-                    alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
-                    holdings_json.append({
-                        'asset': h['asset'],
-                        'amount': h['amount'],
-                        'price': h['price'],
-                        'market_value': h['market_value'],
-                        'allocation_percent': alloc
-                    })
-                
-                result = {
-                    'account': account,
-                    'display_name': nickname,
-                    'deposits': deposits,
-                    'withdrawals': abs(withdrawals),
-                    'net_invested': net_invested,
-                    'current_value': current_value,
-                    'total_gain': total_gainloss,
-                    'total_gain_percent': gainloss_pct,
-                    'apy': apy,
-                    'apy_mode': apy_mode,
-                    'holdings': holdings_json
-                }
-                print(json.dumps(result, indent=2))
-            else:
-                # Print human-readable summary
-                print(f"Account {account} ({nickname})")
-                print(f"Deposits: {deposits:,.0f} SEK")
-                print(f"Withdrawals: {abs(withdrawals):,.0f} SEK")
-                print(f"Net invested: {net_invested:,.0f} SEK")
-                print(f"Current value: {current_value:,.0f} SEK")
-                
-                # Sign formatting
-                gl_sign = "+" if total_gainloss > 0 else ""
-                gl_pct_sign = "+" if gainloss_pct > 0 else ""
-                print(f"Total gain: {gl_sign}{total_gainloss:,.0f} SEK ({gl_pct_sign}{gainloss_pct:.1f}%)")
-                if apy is not None:
-                    print(f"APY: {apy:.1f}% ({mode_label})")
-                else:
-                    print("APY: N/A")
-                
-                if holdings:
-                    print()
-                    print("  Holdings:")
-                    name_w = max(max(len(h['asset']) for h in holdings), 9)
-                    print(f"    {'Fund Name':<{name_w}} {'Market Value':>15} {'Allocation':>11}")
-                    for h in holdings:
-                        alloc = (h['market_value'] / total_assets_val * 100) if total_assets_val > 0 else 0.0
-                        val_str = f"{h['market_value']:,.0f} SEK"
-                        alloc_str = f"{alloc:.1f}%"
-                        print(f"    {h['asset']:<{name_w}} {val_str:>15} {alloc_str:>11}")
-                    
-                    total_val_str = f"{total_assets_val:,.0f} SEK"
-                    print(f"  {'Total':<{name_w + 2}} {total_val_str:>15} {'100.0%':>11}")
-                else:
-                    print()
-                    print("  Holdings: None")
-                    
-        else:
-            # Multi-account table view
-            summaries = []
-            stat_calc = StatCalculator(db)
-            
-            for account in accounts:
-                nickname = nicknames.get(account, account)
-                cash = vals[account]['cash']
-                assets = vals[account]['assets']
-                current_value = cash + assets
-                
-                # Fetch deposits/withdrawals
-                cur.execute("""
-                    SELECT 
-                        COALESCE(SUM(CASE WHEN flow_amount > 0 THEN flow_amount ELSE 0 END), 0) AS deposits,
-                        COALESCE(SUM(CASE WHEN flow_amount < 0 THEN flow_amount ELSE 0 END), 0) AS withdrawals
-                    FROM v_external_capital_flows
-                    WHERE account = ?
-                """, (account,))
-                cf_row = cur.fetchone()
-                deposits = cf_row[0] if cf_row else 0.0
-                withdrawals = cf_row[1] if cf_row else 0.0
-                net_invested = deposits + withdrawals
-                
-                cur.execute("""
-                    SELECT acc_total_gainloss FROM account_cohort_stats
-                    WHERE account = ?
-                    ORDER BY month DESC LIMIT 1
-                """, (account,))
-                gl_row = cur.fetchone()
-                total_gainloss = gl_row[0] if gl_row and gl_row[0] is not None else (current_value - net_invested)
-                
-                gainloss_pct = (total_gainloss / deposits * 100) if deposits > 0 else 0.0
-                apy, total_days = stat_calc.calculate_account_apy(account, apy_mode=apy_mode, end_date=end_date, current_value=current_value)
-                
-                summaries.append({
-                    'account': account,
-                    'display_name': nickname,
-                    'cash': cash,
-                    'assets': assets,
-                    'total': current_value,
-                    'deposits': deposits,
-                    'withdrawals': abs(withdrawals),
-                    'net_invested': net_invested,
-                    'total_gain': total_gainloss,
-                    'total_gain_percent': gainloss_pct,
-                    'apy': apy
-                })
-                
-            if args.format == 'json':
-                import json
-                print(json.dumps(summaries, indent=2))
-            else:
-                if not summaries:
-                    print("No portfolio data found")
-                    return 0
-                    
-                total_cash = sum(s['cash'] for s in summaries)
-                total_assets = sum(s['assets'] for s in summaries)
-                total_total = sum(s['total'] for s in summaries)
-                total_deposits = sum(s['deposits'] for s in summaries)
-                total_withdrawals = sum(s['withdrawals'] for s in summaries)
-                
-                # Fetch combined total gain/loss from DB
-                total_gainloss = 0.0
-                for s in summaries:
-                    total_gainloss += s['total_gain']
-                    
-                total_gain_percent = (total_gainloss / total_deposits * 100) if total_deposits > 0 else 0.0
-                
-                # Calculate combined APY
-                combined_apy, total_days = stat_calc.calculate_account_apy(accounts, apy_mode=apy_mode, end_date=end_date, current_value=total_total)
-                
-                name_width = max(max(len(s['display_name']) for s in summaries), 7)
-                
-                header = f"{'Account':<{name_width}} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12} {'Deposits':>12} {'Gain/Loss':>14} {'Gain (%)':>10} {'APY':>8}"
-                print(header)
-                print("-" * len(header))
-                
-                for s in summaries:
-                    gl_sign = "+" if s['total_gain'] > 0 else ""
-                    gl_pct_sign = "+" if s['total_gain_percent'] > 0 else ""
-                    apy_str = f"{s['apy']:.1f}%" if s['apy'] is not None else "N/A"
-                    
-                    print(f"{s['display_name']:<{name_width}} {s['cash']:>12.0f} {s['assets']:>12.0f} {s['total']:>12.0f} {s['deposits']:>12.0f} {gl_sign}{s['total_gain']:>13.0f} {gl_pct_sign}{s['total_gain_percent']:>8.1f}% {apy_str:>8}")
-                    
-                print("-" * len(header))
-                
-                total_gl_sign = "+" if total_gainloss > 0 else ""
-                total_gl_pct_sign = "+" if total_gain_percent > 0 else ""
-                total_apy_str = f"{combined_apy:.1f}%" if combined_apy is not None else "N/A"
-                
-                print(f"{'TOTAL':<{name_width}} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f} {total_deposits:>12.0f} {total_gl_sign}{total_gainloss:>13.0f} {total_gl_pct_sign}{total_gain_percent:>8.1f}% {total_apy_str:>8}")
-            
-    if warnings and not getattr(args, 'quiet', False):
-        import sys
-        for warning in warnings:
-            print(warning, file=sys.stderr)
-            
-    return 0
+    stats_args = argparse.Namespace(
+        database=args.database,
+        special_cases=getattr(args, 'special_cases', None),
+        account=args.account,
+        apy_mode=getattr(args, 'apy_mode', 'mwrr'),
+        as_of=getattr(args, 'as_of', None),
+        cohorts_start=getattr(args, 'cohorts_start', None),
+        cohorts_end=getattr(args, 'cohorts_end', None),
+        value_start=getattr(args, 'start', None),
+        value_end=getattr(args, 'end', None),
+        start=None,
+        end=None,
+        positions=True,
+        summary=True,
+        is_portfolio=True,
+        format=fmt,
+        quiet=getattr(args, 'quiet', False),
+        period='default',
+        deposits='current',
+        accumulated=False,
+        update_prices='never',
+        update_all=False,
+        force=False
+    )
+    return stats(stats_args)
 
 
 def export_transactions(args):
@@ -1329,14 +1222,46 @@ Examples:
         help='Show statistics as of a previous date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
-        '--start-date',
+        '--cohorts-start',
         default=None,
-        help='Start date for filtering statistics (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='Start date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     stats_parser.add_argument(
-        '--end-date',
+        '--cohorts-end',
         default=None,
-        help='End date for filtering statistics (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--value-start',
+        default=None,
+        help='Start date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--value-end',
+        default=None,
+        help='End date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--start', '--start-date',
+        dest='start',
+        default=None,
+        help='Shorthand setting both --cohorts-start and --value-start (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--end', '--end-date',
+        dest='end',
+        default=None,
+        help='Shorthand setting both --cohorts-end and --value-end (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    stats_parser.add_argument(
+        '--positions', '-p',
+        action='store_true',
+        help='Show asset positions/holdings for each cohort'
+    )
+    stats_parser.add_argument(
+        '--summary', '-s',
+        action='store_true',
+        help='Consolidate cohort stats and positions into a single overview'
     )
     stats_parser.add_argument(
         '--format',
@@ -1407,14 +1332,36 @@ Examples:
         help='Valuation date (YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
-        '--start-date',
+        '--cohorts-start',
         default=None,
-        help='Start date for period comparison (YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='Start date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
-        '--end-date',
+        '--cohorts-end',
         default=None,
-        help='End date for period comparison (YYYY, YYYY-MM, YYYY-MM-DD)'
+        help='End date for filtering cohorts by creation date (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--value-start',
+        default=None,
+        help='Start date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--value-end',
+        default=None,
+        help='End date for valuation window (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--start', '--start-date',
+        dest='start',
+        default=None,
+        help='Shorthand setting both --cohorts-start and --value-start (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
+    )
+    portfolio_parser.add_argument(
+        '--end', '--end-date',
+        dest='end',
+        default=None,
+        help='Shorthand setting both --cohorts-end and --value-end (formats: YYYY, YYYY-MM, YYYY-MM-DD)'
     )
     portfolio_parser.add_argument(
         '--account',

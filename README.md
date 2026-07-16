@@ -307,9 +307,9 @@ The unified CLI provides all functionality in a streamlined interface:
 4. (Optional) Set default accounts for filtering: `python cli.py settings default-accounts "account1,savings_account"`
 5. (Optional) Set account nicknames: `python cli.py settings account-nickname 1234567 "Savings"`
 6. View account summaries: `python cli.py accounts --update-prices auto`
-7. View portfolio snapshot or compare change over a period:
+7. View portfolio snapshot or compare change over a period (equivalent to `stats --positions --summary`):
     - Snapshot: `python cli.py portfolio [--as-of YYYY-MM-DD]`
-    - Period comparison: `python cli.py portfolio --start-date YYYY-MM-DD [--end-date YYYY-MM-DD]`
+    - Period comparison: `python cli.py portfolio --start YYYY-MM-DD [--end YYYY-MM-DD]`
 8. Check system status: `python cli.py status`
 
 Note: All valuation commands (`stats`, `accounts`, `portfolio`) accept a `--format json` flag to return data in machine-readable JSON format instead of a plain-text table/block.
@@ -332,7 +332,7 @@ python cli.py accounts --account all
 python cli.py portfolio --as-of 2026-07-06
 
 # Compare portfolio values between two dates
-python cli.py portfolio --start-date 2026-06-29 --end-date 2026-07-06
+python cli.py portfolio --start 2026-06-29 --end 2026-07-06
 
 # Show portfolio snapshot with Money-Weighted Rate of Return (MWRR) APY
 python cli.py portfolio --account "account1"
