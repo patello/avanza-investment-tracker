@@ -98,6 +98,8 @@ python cli.py --database path/to/db.db --special-cases path/to/special.json impo
 The new `stats` command includes intelligent caching and update logic:
 
 - **Price freshness**: Prices are considered "fresh" if updated within 1 day
+- **Price interpolation**: Historical valuations automatically interpolate missing asset prices linearly between nearest known dates (e.g. from transaction purchases or API price updates).
+  - Use `--no-interpolation` to disable this behavior and fall back to the closest prior price.
 - **Auto-update**: `--update-prices auto` updates only if prices are stale
 - **Force update**: `--update-prices always` forces price refresh
 - **Skip update**: `--update-prices never` uses cached prices
@@ -371,6 +373,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 - `--apy-mode {mwrr,twrr}`: APY calculation method (`mwrr` uses Modified Dietz; `twrr` uses Time-Weighted)
 - `--format {table,json}`: Output formatting (default: `table`)
 - `--quiet`, `-q`: Suppress price data staleness warnings
+- `--no-interpolation`: Disable linear interpolation for sparse historical price data (falls back to nearest prior price, which may trigger staleness warnings)
 
 ### Guidelines: When to use what date boundaries
 1. **To see how cohorts from a certain period look today:**

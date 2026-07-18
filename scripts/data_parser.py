@@ -360,29 +360,26 @@ class DataParser:
         ).fetchone()
         cash = row[0] if row else 0.0
 
-        # Get asset values for this cohort using latest price
-        if as_of_date is not None:
-            asset_value = self.data_cur.execute("""
-                SELECT COALESCE(SUM(ma.amount * COALESCE(
-                    (SELECT price FROM asset_prices WHERE asset_id = ma.asset_id AND price_date <= ? ORDER BY price_date DESC LIMIT 1),
-                    a.latest_price,
-                    ma.average_price
-                )), 0)
-                FROM cohort_assets ma
-                JOIN assets a ON ma.asset_id = a.asset_id
-                WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
-            """, (as_of_date, cohort_month, account)).fetchone()[0]
-        else:
-            asset_value = self.data_cur.execute("""
-                SELECT COALESCE(SUM(ma.amount * COALESCE(
-                    a.latest_price,
-                    (SELECT price FROM asset_prices WHERE asset_id = ma.asset_id ORDER BY price_date DESC LIMIT 1),
-                    ma.average_price
-                )), 0)
-                FROM cohort_assets ma
-                JOIN assets a ON ma.asset_id = a.asset_id
-                WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
-            """, (cohort_month, account)).fetchone()[0]
+        # Get asset holdings for this cohort
+        cursor = self.data_cur.execute("""
+            SELECT ma.asset_id, ma.amount, ma.average_price, a.latest_price
+            FROM cohort_assets ma
+            JOIN assets a ON ma.asset_id = a.asset_id
+            WHERE ma.month = ? AND ma.account = ? AND ma.amount > 0
+        """, (cohort_month, account))
+        holdings = cursor.fetchall()
+
+        asset_value = 0.0
+        for asset_id, amount, avg_price, latest_price in holdings:
+            if as_of_date is not None:
+                price, _, _, _ = self.db.get_price(asset_id, as_of_date)
+            else:
+                price, _, _, _ = self.db.get_price(asset_id, None)
+
+            if price <= 0.0001:
+                price = avg_price if avg_price is not None else 0.0
+
+            asset_value += amount * price
 
         return cash + asset_value
 
@@ -741,17 +738,11 @@ class DataParser:
         
         # Historical price lookup for transactions lacking price
         if price <= 0.0001:
-            self.data_cur.execute("""
-                SELECT price, price_date FROM asset_prices
-                WHERE asset_id = ?
-                ORDER BY ABS(julianday(price_date) - julianday(?)) ASC
-                LIMIT 1
-            """, (asset_id, date))
-            price_row = self.data_cur.fetchone()
-            if price_row and price_row[0] > 0.0001:
-                price = price_row[0]
-                price_date_str = price_row[1]
-                logging.info(f"Resolved missing price for {asset} on {date} using closest price from database ({price} as of {price_date_str})")
+            res_price, is_interp, gap, res_date = self.db.get_price(asset_id, date)
+            if res_price > 0.0001:
+                price = res_price
+                desc = "interpolated" if is_interp else f"as of {res_date}"
+                logging.info(f"Resolved missing price for {asset} on {date} using get_price ({price} {desc})")
                 self.data_cur.execute("UPDATE transactions SET price = ? WHERE rowid = ?", (price, row[-1]))
 
         self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))

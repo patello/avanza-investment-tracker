@@ -14,3 +14,7 @@ __pycache__/
 # Virtual Environment and Pytest Cache
 .venv/
 .pytest_cache/
+
+# Local agent workspace rules
+.agents/
+

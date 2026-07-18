@@ -157,6 +157,7 @@ def test_cohort_value_resolution(tmp_path):
     cur.execute("INSERT INTO asset_prices (asset_id, price_date, price, source) VALUES (?, '2023-03-15', 180.0, 'transaction')", (asset_id,))
     db.commit()
     
+    db.interpolate = False
     parser = DataParser(db)
     
     # 1. Without as_of_date, uses latest_price (200.0)
@@ -239,6 +240,7 @@ def test_historical_price_superseding_and_resolution(tmp_path):
         if db_file.exists():
             db_file.unlink()
         db = DatabaseHandler(str(db_file))
+        db.interpolate = False
         parser = DataParser(db)
         parser.add_data(str(csv_file))
         

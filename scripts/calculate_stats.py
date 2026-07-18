@@ -1378,24 +1378,7 @@ class StatCalculator:
                 """, (acc,))
                 holdings = cur.fetchall()
                 for asset_id, amount in holdings:
-                    if end_date:
-                        price_query = """
-                            SELECT price FROM asset_prices
-                            WHERE asset_id = ? AND price_date <= ?
-                            ORDER BY price_date DESC LIMIT 1
-                        """
-                        cur.execute(price_query, (asset_id, end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)))
-                        p_row = cur.fetchone()
-                        if p_row:
-                            price = p_row[0]
-                        else:
-                            cur.execute("SELECT latest_price FROM assets WHERE asset_id = ?", (asset_id,))
-                            fallback_row = cur.fetchone()
-                            price = fallback_row[0] if fallback_row and fallback_row[0] is not None else 0.0
-                    else:
-                        cur.execute("SELECT latest_price FROM assets WHERE asset_id = ?", (asset_id,))
-                        p_row = cur.fetchone()
-                        price = p_row[0] if p_row and p_row[0] is not None else 0.0
+                    price, _, _, _ = self.db.get_price(asset_id, end_date)
                     assets_value += amount * price
             eval_value = cash + assets_value
             

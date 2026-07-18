@@ -252,7 +252,8 @@ def test_dynamic_label_valuation(stats_positions_test_db, capsys):
         positions=False,
         summary=False,
         format='table',
-        quiet=True
+        quiet=True,
+        no_interpolation=True
     )
     stats(args)
     captured = capsys.readouterr()

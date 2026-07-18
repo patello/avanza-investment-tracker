@@ -370,6 +370,7 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
     shutil.copy2(db.db_file, temp_db_path)
     
     temp_db = DatabaseHandler(temp_db_path)
+    temp_db.interpolate = db.interpolate
     temp_db.connect()
     
     temp_cur = temp_db.get_cursor()
@@ -392,19 +393,15 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
     
     assets = temp_cur.execute("SELECT asset_id, asset FROM assets").fetchall()
     for asset_id, asset_name in assets:
-        price_row = temp_cur.execute("""
-            SELECT price, price_date FROM asset_prices
-            WHERE asset_id = ? AND price_date <= ?
-            ORDER BY price_date DESC LIMIT 1
-        """, (asset_id, t_date.isoformat())).fetchone()
-        if price_row:
+        price, is_interpolated, gap, price_date = temp_db.get_price(asset_id, t_date)
+        if price is not None and price > 0:
             temp_cur.execute("""
                 UPDATE assets
                 SET latest_price = ?, latest_price_date = ?
                 WHERE asset_id = ?
-            """, (price_row[0], price_row[1], asset_id))
+            """, (price, price_date, asset_id))
             if asset_id in held_asset_ids:
-                check_price_staleness(asset_name, price_row[1], t_date, warnings)
+                check_price_staleness(asset_name, price_date, t_date, warnings)
     temp_db.commit()
     
     stat_calc = StatCalculator(temp_db)
@@ -417,6 +414,7 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
 def stats(args):
     """Smart statistics command with automatic updates."""
     db = get_db(args)
+    db.interpolate = not getattr(args, 'no_interpolation', False)
     
     # Parse account filter
     accounts = resolve_accounts(db, args.account)
@@ -1134,6 +1132,7 @@ def portfolio(args):
         is_portfolio=True,
         format=fmt,
         quiet=getattr(args, 'quiet', False),
+        no_interpolation=getattr(args, 'no_interpolation', False),
         period='default',
         deposits='current',
         accumulated=False,
@@ -1342,6 +1341,11 @@ Examples:
         action='store_true',
         help='Suppress price data staleness warnings'
     )
+    stats_parser.add_argument(
+        '--no-interpolation',
+        action='store_true',
+        help='Disable linear interpolation for sparse historical price data'
+    )
     stats_parser.set_defaults(func=stats)
     
     # Settings command
@@ -1446,6 +1450,11 @@ Examples:
         '--quiet', '-q',
         action='store_true',
         help='Suppress price data staleness warnings'
+    )
+    portfolio_parser.add_argument(
+        '--no-interpolation',
+        action='store_true',
+        help='Disable linear interpolation for sparse historical price data'
     )
     portfolio_parser.set_defaults(func=portfolio)
     

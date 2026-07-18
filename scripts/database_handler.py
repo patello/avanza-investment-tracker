@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import date
+import bisect
 
 def adapt_date(val):
     """Convert datetime.date to ISO format string."""
@@ -25,6 +26,8 @@ class DatabaseHandler:
         """
         self.db_file = db_file
         self.conn = None
+        self._price_cache = {}
+        self.interpolate = True
         self.connect()
         self.tables = self.create_tables()
         self.disconnect()
@@ -53,6 +56,7 @@ class DatabaseHandler:
         """
         if self.conn:
             self.conn.commit()
+            self.clear_price_cache()
         else:
             raise Exception("Cannot commit changes, database connection not established.")
         
@@ -561,6 +565,123 @@ class DatabaseHandler:
         cursor.execute("SELECT MIN(date), MAX(date) FROM transactions")
         result = cursor.fetchone()
         return (result[0], result[1]) if result else (None, None)
+
+    def clear_price_cache(self) -> None:
+        """Clear the in-memory price cache."""
+        self._price_cache = {}
+
+    def get_price(self, asset_id: int, target_date=None, interpolate: bool = None) -> tuple:
+        """
+        Get the price of an asset as of a target date.
+        Uses exact match if available, otherwise linear interpolation between nearest dates.
+        
+        Parameters:
+        asset_id (int): Asset ID.
+        target_date (date or str, optional): Target date. If None, retrieves latest price.
+        interpolate (bool, optional): Whether to interpolate missing prices. Defaults to self.interpolate.
+        
+        Returns:
+        tuple: (price (float), is_interpolated (bool), interpolation_gap (int or None), price_date (date or None))
+        """
+        if interpolate is None:
+            interpolate = self.interpolate
+
+        if isinstance(target_date, str):
+            target_date = date.fromisoformat(target_date)
+
+        if asset_id not in self._price_cache:
+            cursor = self.get_cursor()
+            cursor.execute(
+                "SELECT price_date, price FROM asset_prices WHERE asset_id = ? ORDER BY price_date ASC",
+                (asset_id,)
+            )
+            rows = cursor.fetchall()
+            self._price_cache[asset_id] = [(row[0], row[1]) for row in rows]
+
+        prices = self._price_cache[asset_id]
+
+        if not prices:
+            # Fallback 1: No price points at all. Fetch from assets table.
+            cursor = self.get_cursor()
+            cursor.execute(
+                "SELECT latest_price, average_price, average_purchase_price, latest_price_date FROM assets WHERE asset_id = ?",
+                (asset_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                latest, avg, avg_pur, latest_date = row
+                price = latest if latest is not None and latest > 0 else (
+                    avg if avg is not None and avg > 0 else (
+                        avg_pur if avg_pur is not None and avg_pur > 0 else 0.0
+                    )
+                )
+                if isinstance(latest_date, str):
+                    latest_date = date.fromisoformat(latest_date)
+                return price, False, None, latest_date
+            return 0.0, False, None, None
+
+        if target_date is None:
+            # Fallback 2: target_date is None. Return latest price.
+            cursor = self.get_cursor()
+            cursor.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset_id = ?", (asset_id,))
+            row = cursor.fetchone()
+            if row and row[0] is not None and row[0] > 0:
+                latest_price, latest_date = row[0], row[1]
+                if isinstance(latest_date, str):
+                    latest_date = date.fromisoformat(latest_date)
+                return latest_price, False, None, latest_date
+            return prices[-1][1], False, None, prices[-1][0]
+
+        # Use bisect to find target date in the sorted list of prices
+        dates = [p[0] for p in prices]
+        idx = bisect.bisect_left(dates, target_date)
+
+        # Case 1: Exact match
+        if idx < len(dates) and dates[idx] == target_date:
+            return prices[idx][1], False, 0, target_date
+
+        # Case 2: Before first known price point
+        if idx == 0:
+            # Try latest_price from assets first, otherwise flat from first known price
+            cursor = self.get_cursor()
+            cursor.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset_id = ?", (asset_id,))
+            row = cursor.fetchone()
+            if row and row[0] is not None and row[0] > 0:
+                latest_price, latest_date = row[0], row[1]
+                if isinstance(latest_date, str):
+                    latest_date = date.fromisoformat(latest_date)
+                return latest_price, False, None, latest_date
+            return prices[0][1], False, None, prices[0][0]
+
+        # Case 3: After last known price point
+        if idx == len(dates):
+            # Try latest_price from assets first, but only if its date is >= last price date in asset_prices
+            cursor = self.get_cursor()
+            cursor.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset_id = ?", (asset_id,))
+            row = cursor.fetchone()
+            if row and row[0] is not None and row[0] > 0:
+                latest_price, latest_date = row[0], row[1]
+                if isinstance(latest_date, str):
+                    latest_date = date.fromisoformat(latest_date)
+                if latest_date and latest_date >= prices[-1][0]:
+                    return latest_price, False, None, latest_date
+            return prices[-1][1], False, None, prices[-1][0]
+
+        # Case 4: Between two known price points
+        t_before, p_before = prices[idx - 1]
+        t_after, p_after = prices[idx]
+
+        if interpolate:
+            days_total = (t_after - t_before).days
+            days_target = (target_date - t_before).days
+            if days_total == 0:
+                return p_before, False, 0, t_before
+            interpolated_price = p_before + (p_after - p_before) * (days_target / days_total)
+            # Return target_date as price_date to prevent false staleness warnings
+            return interpolated_price, True, days_total, target_date
+        else:
+            # Revert to nearest price before target date and return its actual date (so it can be flagged as stale)
+            return p_before, False, None, t_before
 
 
 # Example Usage
