@@ -386,17 +386,50 @@ class RiskCalculator:
             sampling_dates = sampling_dates[start_slice:]
             portfolio_values = portfolio_values[start_slice:]
 
-        # 4. Fetch daily cash flows (from cohort-specific tables)
+        # 4. Fetch daily cash flows
         from collections import defaultdict
         cash_flows_by_date = defaultdict(float)
         
-        for m_str, dep in deposits_by_month.items():
-            m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-            cash_flows_by_date[m_date] += dep
+        if self.cohorts_start is not None or self.cohorts_end is not None:
+            # Cohort-specific cash flows (from cohort tables)
+            for m_str, dep in deposits_by_month.items():
+                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
+                cash_flows_by_date[m_date] += dep
+                
+            for m_str, cf in cf_by_month.items():
+                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
+                cash_flows_by_date[m_date] += cf
+        else:
+            # Full portfolio cash flows (query from raw transactions)
+            if accounts_list:
+                placeholders = ",".join("?" for _ in accounts_list)
+                query = f"""
+                    SELECT date, transaction_type, total, amount, price 
+                    FROM transactions 
+                    WHERE date > ? AND date <= ? AND account IN ({placeholders})
+                """
+                params = [sampling_dates[0].isoformat(), to_date.isoformat()] + accounts_list
+            else:
+                query = """
+                    SELECT date, transaction_type, total, amount, price 
+                    FROM transactions 
+                    WHERE date > ? AND date <= ?
+                """
+                params = [sampling_dates[0].isoformat(), to_date.isoformat()]
+                
+            cur.execute(query, params)
+            tx_rows = cur.fetchall()
             
-        for m_str, cf in cf_by_month.items():
-            m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-            cash_flows_by_date[m_date] += cf
+            for date_str, tx_type, total, amount, price in tx_rows:
+                if isinstance(date_str, str):
+                    tx_date = datetime_cls.strptime(date_str, "%Y-%m-%d").date()
+                else:
+                    tx_date = date_str
+                    
+                if tx_type in ("Insättning", "Autogiroinsättning", "Uttag", "Intern överföring"):
+                    cash_flows_by_date[tx_date] += total
+                elif tx_type == "Tillgångsinsättning":
+                    cash_flows_by_date[tx_date] += amount * price
 
         cash_flows = []
         for i in range(1, len(sampling_dates)):
