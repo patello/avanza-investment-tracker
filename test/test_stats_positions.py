@@ -350,4 +350,69 @@ def test_cohort_shorthand_filtering(stats_positions_test_db, capsys):
     assert stats(args3) == 1  # Should return error code 1
 
 
+def test_multi_account_stats_apy_with_end_date(tmp_path):
+    from datetime import date
+    from database_handler import DatabaseHandler
+    from data_parser import DataParser
+    from calculate_stats import StatCalculator
+
+    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
+2025-01-01;1111;Insättning;Deposit;-;-;10000;0;SEK;;-
+2025-01-02;1111;Köp;Mock Fund A;10;100;-1000;0;SEK;MOCKA;-
+2025-01-01;2222;Insättning;Deposit;-;-;5000;0;SEK;;-
+2025-01-02;2222;Köp;Mock Fund A;5;100;-500;0;SEK;MOCKA;-
+"""
+    csv_file = tmp_path / "test_multi_apy.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    db_file = tmp_path / "test_multi_apy.db"
+    db = DatabaseHandler(db_file)
+
+    parser = DataParser(db)
+    parser.add_data(str(csv_file))
+    parser.process_transactions()
+
+    cur = db.get_cursor()
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2025-01-02', 100.0, 'external')")
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2025-06-30', 150.0, 'external')")
+    cur.execute("UPDATE assets SET latest_price = 150.0, latest_price_date = '2025-06-30' WHERE asset_id = 1")
+    db.commit()
+
+    # Pre-populate stats
+    stat_calc = StatCalculator(db)
+    # We run stats calculation as of 2025-06-30
+    stat_calc.calculate_cohort_stats(apy_mode='mwrr', today=date(2025, 6, 30))
+    stat_calc.calculate_year_stats(apy_mode='mwrr', today=date(2025, 6, 30))
+
+    # Test get_stats with end_date=2025-06-30
+    res_with_end = stat_calc.get_stats(
+        accounts=['1111', '2222'],
+        period='year',
+        deposits='all',
+        end_date=date(2025, 6, 30)
+    )
+
+    # Test get_stats with end_date=None (defaults to system today)
+    res_without_end = stat_calc.get_stats(
+        accounts=['1111', '2222'],
+        period='year',
+        deposits='all',
+        end_date=None
+    )
+
+    assert len(res_with_end) > 0
+    assert len(res_without_end) > 0
+
+    apy_with = res_with_end[0][10]
+    apy_without = res_without_end[0][10]
+
+    # APY with past end_date (2025-06-30) should use 2025-06-30 as today, which is ~180 days from cohort start.
+    # APY without end_date will use system today, which is in 2026 (~540+ days).
+    # Since the position grew (from 100 to 150), HPR is positive, so the shorter holding period (2025-06-30)
+    # should yield a higher APY.
+    assert apy_with > apy_without
+    assert apy_with != 0.0
+    assert apy_without != 0.0
+
+
 

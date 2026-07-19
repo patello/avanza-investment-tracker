@@ -614,7 +614,9 @@ def stats(args):
         start_map = {}
         if value_start is not None:
             start_calc = StatCalculator(start_temp_db)
-            start_stats = start_calc.get_stats(**kwargs)
+            start_kwargs = kwargs.copy()
+            start_kwargs['end_date'] = value_start
+            start_stats = start_calc.get_stats(**start_kwargs)
             
             def get_key(d):
                 if hasattr(d, 'isoformat'):
@@ -624,7 +626,9 @@ def stats(args):
             start_map = { get_key(r[0]): r for r in start_stats }
             
             end_calc = StatCalculator(end_temp_db)
-            end_stats = end_calc.get_stats(**kwargs)
+            end_kwargs = kwargs.copy()
+            end_kwargs['end_date'] = target_end_date
+            end_stats = end_calc.get_stats(**end_kwargs)
             
             stats_list = []
             days = (target_end_date - value_start).days
@@ -658,6 +662,8 @@ def stats(args):
                     # Cohort didn't exist at value_start
                     stats_list.append(end_row + (0.0,))
         else:
+            if target_end_date is not None:
+                kwargs['end_date'] = target_end_date
             stats_list = stat_calc.get_stats(**kwargs)
             
         # Filter by deposits parameter for double snapshot
