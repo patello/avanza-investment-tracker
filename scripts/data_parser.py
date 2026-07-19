@@ -943,7 +943,7 @@ class DataParser:
             logging.warning(f"Not enough shares to remove for {asset}: have {total_asset_amount}, need {asset_amount}")
             raise AssetDeficit(f"Not enough shares to remove for {asset}", self)
 
-    def process_transactions(self) -> None:
+    def process_transactions(self, raise_on_unprocessed: bool = True) -> None:
         """
         Process transactions all transactions in the database that have not been processed yet.
         After attempting to processing all transactions, the function checks if there are any unprocessed transactions left.
@@ -1025,7 +1025,10 @@ class DataParser:
 
         unprocessed_count = self.transaction_cur.execute("SELECT COUNT(*) FROM transactions WHERE processed == 0").fetchone()[0]
         if unprocessed_count > 0:
-            raise AssetDeficit("There are {} transaction(s) that could not be processed due to a missmatch of assets in the database".format(unprocessed_count),self)
+            if raise_on_unprocessed:
+                raise AssetDeficit("There are {} transaction(s) that could not be processed due to a missmatch of assets in the database".format(unprocessed_count),self)
+            else:
+                logging.warning("There are {} transaction(s) left unprocessed (normal for temporary historical snapshots)".format(unprocessed_count))
         else:
             #Calculate summary data and put it in asset table
             asset_ids = self.data_cur.execute("SELECT asset_id FROM assets").fetchall()

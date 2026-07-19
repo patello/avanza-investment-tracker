@@ -385,7 +385,7 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
     
     special_cases = SpecialCases(special_cases_path) if special_cases_path else None
     parser = DataParser(temp_db, special_cases)
-    parser.process_transactions()
+    parser.process_transactions(raise_on_unprocessed=False)
     
     # Resolve prices
     held_assets_rows = temp_cur.execute("SELECT DISTINCT asset_id FROM cohort_assets WHERE amount > 0.001").fetchall()
@@ -409,6 +409,32 @@ def create_temp_snapshot_db(db, target_date, apy_mode, special_cases_path, warni
     stat_calc.calculate_year_stats(apy_mode=apy_mode, today=t_date)
     
     return temp_db, temp_db_path
+
+
+def print_risk_metrics_table(risk_metrics, beta_ticker=None):
+    p_start = risk_metrics['period_start'].isoformat()
+    p_end = risk_metrics['period_end'].isoformat()
+    
+    print(f"\nPortfolio Risk Metrics ({p_start} to {p_end})")
+    print("==================================================")
+    print(f"Annualized Return:      {risk_metrics['annualized_return']*100:.1f}%")
+    print(f"Standard Deviation:     {risk_metrics['annualized_stddev']*100:.1f}%")
+    print(f"Sharpe Ratio:           {risk_metrics['sharpe_ratio']:.2f}")
+    print(f"Sortino Ratio:          {risk_metrics['sortino_ratio']:.2f}")
+    
+    dd_val = risk_metrics['max_drawdown'] * 100
+    peak = risk_metrics['max_drawdown_peak']
+    trough = risk_metrics['max_drawdown_trough']
+    if peak and trough:
+        peak_str = peak.strftime("%Y-%m")
+        trough_str = trough.strftime("%Y-%m")
+        print(f"Maximum Drawdown:      -{dd_val:.1f}%  ({peak_str} to {trough_str})")
+    else:
+        print(f"Maximum Drawdown:      -{dd_val:.1f}%")
+        
+    if risk_metrics['beta'] is not None:
+        ticker = beta_ticker if beta_ticker else '^OMXSPI'
+        print(f"Beta vs {ticker}:         {risk_metrics['beta']:.2f}")
 
 
 def stats(args):
@@ -658,6 +684,26 @@ def stats(args):
             filtered_stats.append(row)
         stats_list = filtered_stats
         
+        # Calculate risk metrics if requested
+        risk_metrics = None
+        if getattr(args, 'risk', False) or getattr(args, 'beta', None) is not None:
+            from risk_calculator import RiskCalculator
+            calc_end_date = target_end_date if target_end_date is not None else date.today()
+            calculator = RiskCalculator(
+                db=db,
+                accounts=args.account,
+                from_date=value_start,
+                to_date=calc_end_date,
+                cohorts_start=cohorts_start,
+                cohorts_end=cohorts_end,
+                beta_ticker=getattr(args, 'beta', None),
+                interpolate=db.interpolate
+            )
+            try:
+                risk_metrics = calculator.calculate(apy_mode=apy_mode)
+            except Exception as e:
+                logging.error(f"Failed to calculate risk metrics: {e}")
+        
         # Output summary mode or standard list mode
         if getattr(args, 'summary', False):
             total_dep = sum(row[1] for row in stats_list)
@@ -715,6 +761,19 @@ def stats(args):
                         }
                         for h in holdings
                     ]
+                if risk_metrics:
+                    result['risk'] = {
+                        'annualized_return': risk_metrics['annualized_return'],
+                        'annualized_stddev': risk_metrics['annualized_stddev'],
+                        'sharpe_ratio': risk_metrics['sharpe_ratio'],
+                        'sortino_ratio': risk_metrics['sortino_ratio'],
+                        'max_drawdown': risk_metrics['max_drawdown'],
+                        'max_drawdown_peak': risk_metrics['max_drawdown_peak'].isoformat() if risk_metrics['max_drawdown_peak'] else None,
+                        'max_drawdown_trough': risk_metrics['max_drawdown_trough'].isoformat() if risk_metrics['max_drawdown_trough'] else None,
+                        'beta': risk_metrics['beta'],
+                        'risk_free_rate': risk_metrics['risk_free_rate'],
+                        'year_returns': risk_metrics['year_returns']
+                    }
                 print(json.dumps(result, indent=2))
             else:
                 is_portfolio = getattr(args, 'is_portfolio', False)
@@ -765,6 +824,8 @@ def stats(args):
                         print(f"  {'Total':<{name_w}} {total_assets_val:>15,.0f} SEK {'100.0%':>11}")
                     else:
                         print("  None")
+                if risk_metrics:
+                    print_risk_metrics_table(risk_metrics, beta_ticker=getattr(args, 'beta', None))
         else:
             # Cohort-level breakdown mode
             if getattr(args, 'format', 'table') == 'json':
@@ -810,7 +871,25 @@ def stats(args):
                                 for h in cohort_holdings
                             ]
                         json_data.append(cohort_data)
-                print(json.dumps(json_data, indent=2))
+                if risk_metrics:
+                    formatted_risk = {
+                        'annualized_return': risk_metrics['annualized_return'],
+                        'annualized_stddev': risk_metrics['annualized_stddev'],
+                        'sharpe_ratio': risk_metrics['sharpe_ratio'],
+                        'sortino_ratio': risk_metrics['sortino_ratio'],
+                        'max_drawdown': risk_metrics['max_drawdown'],
+                        'max_drawdown_peak': risk_metrics['max_drawdown_peak'].isoformat() if risk_metrics['max_drawdown_peak'] else None,
+                        'max_drawdown_trough': risk_metrics['max_drawdown_trough'].isoformat() if risk_metrics['max_drawdown_trough'] else None,
+                        'beta': risk_metrics['beta'],
+                        'risk_free_rate': risk_metrics['risk_free_rate'],
+                        'year_returns': risk_metrics['year_returns']
+                    }
+                    print(json.dumps({
+                        'cohorts': json_data,
+                        'risk': formatted_risk
+                    }, indent=2))
+                else:
+                    print(json.dumps(json_data, indent=2))
             else:
                 for row in stats_list:
                     if row[1] > 0 or row[3] > 0:
@@ -858,6 +937,8 @@ def stats(args):
                             else:
                                 print("  Holdings: None")
                         print()
+                if risk_metrics:
+                    print_risk_metrics_table(risk_metrics, beta_ticker=getattr(args, 'beta', None))
                         
         if warnings and not getattr(args, 'quiet', False):
             import sys
@@ -1133,6 +1214,8 @@ def portfolio(args):
         format=fmt,
         quiet=getattr(args, 'quiet', False),
         no_interpolation=getattr(args, 'no_interpolation', False),
+        risk=getattr(args, 'risk', False),
+        beta=getattr(args, 'beta', None),
         period='default',
         deposits='current',
         accumulated=False,
@@ -1346,6 +1429,18 @@ Examples:
         action='store_true',
         help='Disable linear interpolation for sparse historical price data'
     )
+    stats_parser.add_argument(
+        '--risk',
+        action='store_true',
+        help='Calculate and display portfolio-level risk metrics (Stddev, Sharpe, Sortino, Max Drawdown)'
+    )
+    stats_parser.add_argument(
+        '--beta',
+        nargs='?',
+        const='^OMXSPI',
+        default=None,
+        help='Include beta calculation vs specified benchmark (default: ^OMXSPI if flag is passed)'
+    )
     stats_parser.set_defaults(func=stats)
     
     # Settings command
@@ -1455,6 +1550,18 @@ Examples:
         '--no-interpolation',
         action='store_true',
         help='Disable linear interpolation for sparse historical price data'
+    )
+    portfolio_parser.add_argument(
+        '--risk',
+        action='store_true',
+        help='Calculate and display portfolio-level risk metrics (Stddev, Sharpe, Sortino, Max Drawdown)'
+    )
+    portfolio_parser.add_argument(
+        '--beta',
+        nargs='?',
+        const='^OMXSPI',
+        default=None,
+        help='Include beta calculation vs specified benchmark (default: ^OMXSPI if flag is passed)'
     )
     portfolio_parser.set_defaults(func=portfolio)
     
