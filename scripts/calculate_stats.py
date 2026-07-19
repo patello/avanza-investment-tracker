@@ -756,7 +756,13 @@ class StatCalculator:
             
             # Recalculate percentages and APY
             stats = []
-            today = datetime.today().date()
+            if end_date is not None:
+                if isinstance(end_date, str):
+                    today = datetime.strptime(end_date, "%Y-%m-%d").date()
+                else:
+                    today = end_date
+            else:
+                today = datetime.today().date()
             
             for row in rows:
                 month = row[0]
@@ -814,7 +820,13 @@ class StatCalculator:
             
             # Recalculate percentages and APY
             stats = []
-            today = datetime.today().date()
+            if end_date is not None:
+                if isinstance(end_date, str):
+                    today = datetime.strptime(end_date, "%Y-%m-%d").date()
+                else:
+                    today = end_date
+            else:
+                today = datetime.today().date()
             
             for row in rows:
                 year_str = row[0]
