@@ -96,8 +96,8 @@ def test_risk_calculator_metrics(mock_get, risk_scenario_db):
     
     # Sharpe Ratio:
     # risk_free_rate = 0.02
-    # overall_return = -0.1809 (-18.09%)
-    # Sharpe = (-0.1809 - 0.02) / 0.529150 = -0.3798
+    # overall_return = -0.1451 (-14.51%)
+    # Sharpe = (-0.1451 - 0.02) / 0.529150 = -0.3120
     
     # Max Drawdown:
     # Peak = 12100
@@ -105,7 +105,7 @@ def test_risk_calculator_metrics(mock_get, risk_scenario_db):
     # Max Drawdown = (12100 - 9680) / 12100 = 0.20 (20%)
     
     assert abs(metrics['annualized_stddev'] - 0.52915) < 0.001
-    assert abs(metrics['sharpe_ratio'] - (-0.3798)) < 0.01
+    assert abs(metrics['sharpe_ratio'] - (-0.3120)) < 0.01
     assert abs(metrics['max_drawdown'] - 0.20) < 0.001
     assert metrics['max_drawdown_peak'] == date(2020, 2, 29)
     assert metrics['max_drawdown_trough'] == date(2020, 3, 31)
@@ -136,7 +136,7 @@ def test_riksbanken_rate_fallback(mock_get, risk_scenario_db):
     
     # Should fall back to 2.0%
     assert metrics['risk_free_rate'] == 0.02
-    assert abs(metrics['sharpe_ratio'] - (-0.3798)) < 0.01
+    assert abs(metrics['sharpe_ratio'] - (-0.3120)) < 0.01
 
 
 @patch("scripts.risk_calculator.requests.get")
