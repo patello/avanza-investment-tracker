@@ -417,7 +417,6 @@ def print_risk_metrics_table(risk_metrics, beta_ticker=None):
     
     print(f"\nPortfolio Risk Metrics ({p_start} to {p_end})")
     print("==================================================")
-    print(f"Annualized Return:      {risk_metrics['annualized_return']*100:.1f}%")
     print(f"Standard Deviation:     {risk_metrics['annualized_stddev']*100:.1f}%")
     print(f"Sharpe Ratio:           {risk_metrics['sharpe_ratio']:.2f}")
     print(f"Sortino Ratio:          {risk_metrics['sortino_ratio']:.2f}")
