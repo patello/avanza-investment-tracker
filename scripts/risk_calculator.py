@@ -480,6 +480,11 @@ class RiskCalculator:
 
         is_cohort = self.cohorts_start is not None or self.cohorts_end is not None
 
+        # For cohort mode: collect Uttag transactions by allocation month,
+        # so cf_by_month amounts can be distributed across actual transaction
+        # dates (see below) instead of allocation months.
+        uttag_by_alloc = defaultdict(list)  # alloc_month_date -> [(tx_date, total)]
+
         cur.execute(query, params)
         for date_str, tx_type, total, amount, price in cur.fetchall():
             if isinstance(date_str, str):
@@ -487,35 +492,44 @@ class RiskCalculator:
             else:
                 tx_date = date_str
 
-            # For cohort mode, only include deposits whose allocation month
-            # is within the cohort range.
+            # For cohort mode, only include transactions whose allocation
+            # month is within the cohort range.
             if is_cohort:
                 am = _alloc_month(tx_date)
                 if self.cohorts_start is not None and am < self.cohorts_start:
                     continue
                 if self.cohorts_end is not None and am > self.cohorts_end:
                     continue
+                # Collect Uttag for proportional distribution of cf_by_month
+                if tx_type == "Uttag":
+                    uttag_by_alloc[am].append((tx_date, total))
 
             if tx_type in ("Insättning", "Autogiroinsättning", "Intern överföring"):
                 cash_flows_by_date[tx_date] += total
             elif tx_type == "Tillgångsinsättning":
                 cash_flows_by_date[tx_date] += amount * price
             elif tx_type == "Uttag" and not is_cohort:
-                # Non-cohort: withdrawals from raw transactions.
-                # Cohort mode uses cf_by_month instead (correct transaction timing).
+                # Non-cohort: withdrawals from raw transactions directly.
                 cash_flows_by_date[tx_date] += total
 
         # Cohort cash flows (withdrawals, fees, taxes) from cohort_cash_flows.
-        # These have correct transaction-month timing — the transaction_month
-        # reflects when the withdrawal/fee actually occurred, not the cohort's
-        # deposit month. Using cohort_data.withdrawal instead would place
-        # withdrawals in the wrong period (the cohort month) AND double-count
-        # them (they're already here).
+        # Distribute across actual Uttag transaction dates proportionally so
+        # that Modified Dietz time-weighting uses when the cash flow actually
+        # occurred, not the allocation month (which can differ by up to 10
+        # days due to the cutoff). For months with no Uttag (fees only),
+        # use mid-month approximation.
         if is_cohort:
             for m_str, cf_amt in cf_by_month.items():
                 m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-                cf_date = date(m_date.year, m_date.month, 15)
-                cash_flows_by_date[cf_date] += cf_amt
+                uttags = uttag_by_alloc.get(m_date, [])
+                raw_total = sum(t for _, t in uttags)
+                if uttags and abs(raw_total) > 0.01:
+                    for tx_date, tx_total in uttags:
+                        cash_flows_by_date[tx_date] += cf_amt * (tx_total / raw_total)
+                else:
+                    # No Uttag for this allocation month — fees only
+                    cf_date = date(m_date.year, m_date.month, 15)
+                    cash_flows_by_date[cf_date] += cf_amt
 
         # Assign cash flows to sampling periods, keeping (date, amount) pairs
         # for Modified Dietz time-weighting.
