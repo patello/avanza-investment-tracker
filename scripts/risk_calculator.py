@@ -413,7 +413,7 @@ class RiskCalculator:
             raise ValueError(f"Start date {from_date} cannot be after end date {to_date}")
 
         # 2. Reconstruct historical holdings state
-        history, deposits_by_month, cf_by_month, withdrawals_by_month = self.get_historical_holdings(to_date)
+        history, deposits_by_month, cf_by_month = self.get_historical_holdings(to_date)
         sampling_dates = generate_monthly_dates(from_date, to_date)
         
         # 3. Calculate portfolio values at each monthly end date
@@ -462,7 +462,11 @@ class RiskCalculator:
                     m, y = 12, y - 1
             return date(y, m, _cal.monthrange(y, m)[1])
 
-        # Deposits from raw transactions (actual dates for Modified Dietz)
+        # Build cash flows from raw transactions with actual dates.
+        # Deposits (Insättning etc.) are always included. For non-cohort
+        # mode, Uttag (withdrawals) are also included directly. For cohort
+        # mode, withdrawals come from cf_by_month (below) which has correct
+        # transaction-month timing from cohort_cash_flows.
         if accounts_list:
             placeholders = ",".join("?" for _ in accounts_list)
             query = (f"SELECT date, transaction_type, total, amount, price "
@@ -474,6 +478,8 @@ class RiskCalculator:
                      "FROM transactions WHERE date > ? AND date <= ?")
             params = [sampling_dates[0].isoformat(), to_date.isoformat()]
 
+        is_cohort = self.cohorts_start is not None or self.cohorts_end is not None
+
         cur.execute(query, params)
         for date_str, tx_type, total, amount, price in cur.fetchall():
             if isinstance(date_str, str):
@@ -483,7 +489,7 @@ class RiskCalculator:
 
             # For cohort mode, only include deposits whose allocation month
             # is within the cohort range.
-            if self.cohorts_start is not None or self.cohorts_end is not None:
+            if is_cohort:
                 am = _alloc_month(tx_date)
                 if self.cohorts_start is not None and am < self.cohorts_start:
                     continue
@@ -494,24 +500,18 @@ class RiskCalculator:
                 cash_flows_by_date[tx_date] += total
             elif tx_type == "Tillgångsinsättning":
                 cash_flows_by_date[tx_date] += amount * price
+            elif tx_type == "Uttag" and not is_cohort:
+                # Non-cohort: withdrawals from raw transactions.
+                # Cohort mode uses cf_by_month instead (correct transaction timing).
+                cash_flows_by_date[tx_date] += total
 
-        # Withdrawals from cohort_data (cohort-scoped amounts, mid-month timing)
-        if self.cohorts_start is not None or self.cohorts_end is not None:
-            for m_str, wd in withdrawals_by_month.items():
-                if wd and abs(wd) > 0.01:
-                    m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-                    cf_date = date(m_date.year, m_date.month, 15)
-                    cash_flows_by_date[cf_date] -= wd
-        else:
-            # Non-cohort: include Uttag from raw transactions (actual dates)
-            cur.execute(query, params)
-            for date_str, tx_type, total, amount, price in cur.fetchall():
-                if tx_type == "Uttag":
-                    tx_date = datetime_cls.strptime(date_str, "%Y-%m-%d").date() if isinstance(date_str, str) else date_str
-                    cash_flows_by_date[tx_date] += total
-
-        # Cohort-specific non-deposit cash flows (dividends, fees, taxes)
-        if self.cohorts_start is not None or self.cohorts_end is not None:
+        # Cohort cash flows (withdrawals, fees, taxes) from cohort_cash_flows.
+        # These have correct transaction-month timing — the transaction_month
+        # reflects when the withdrawal/fee actually occurred, not the cohort's
+        # deposit month. Using cohort_data.withdrawal instead would place
+        # withdrawals in the wrong period (the cohort month) AND double-count
+        # them (they're already here).
+        if is_cohort:
             for m_str, cf_amt in cf_by_month.items():
                 m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
                 cf_date = date(m_date.year, m_date.month, 15)
@@ -787,54 +787,6 @@ class RiskCalculator:
             cf_by_month = {row[0]: row[1] for row in cur.fetchall()}
 
             # Query withdrawals from cohort_data (correctly cohort-scoped).
-            # The withdrawal column reflects only the portion that could be
-            # resolved against THIS cohort's capital — large withdrawals
-            # that pull pre-cohort capital are NOT included here, which is
-            # the correct behaviour for cohort-scoped risk metrics.
-            query_wd = "SELECT month, SUM(withdrawal) FROM cohort_data"
-            params_wd = []
-            if self.cohorts_start or self.cohorts_end:
-                query_wd += " WHERE 1=1"
-                if self.cohorts_start:
-                    query_wd += " AND month >= ?"
-                    params_wd.append(self.cohorts_start.isoformat())
-                if self.cohorts_end:
-                    query_wd += " AND month <= ?"
-                    params_wd.append(self.cohorts_end.isoformat())
-            query_wd += " GROUP BY month"
-            cur.execute(query_wd, params_wd)
-            withdrawals_by_month = {row[0]: row[1] for row in cur.fetchall()}
-
-            # Query gross deposits (before withdrawal subtraction) for the
-            # withdrawal cap below.
-            query_gd = "SELECT month, SUM(deposit) FROM cohort_data"
-            params_gd = []
-            if self.cohorts_start or self.cohorts_end:
-                query_gd += " WHERE 1=1"
-                if self.cohorts_start:
-                    query_gd += " AND month >= ?"
-                    params_gd.append(self.cohorts_start.isoformat())
-                if self.cohorts_end:
-                    query_gd += " AND month <= ?"
-                    params_gd.append(self.cohorts_end.isoformat())
-            query_gd += " GROUP BY month"
-            cur.execute(query_gd, params_gd)
-            gross_deposits_by_month = {row[0]: row[1] for row in cur.fetchall()}
-
-            # Cap cumulative withdrawals at cumulative gross deposits. The
-            # cohort system's FIFO accounting can record withdrawals that
-            # draw from pre-cohort capital, producing negative Modified Dietz
-            # denominators. Capping ensures a cohort never withdraws more
-            # than was deposited into it.
-            cum_dep = 0.0
-            cum_wd = 0.0
-            for m in sorted(withdrawals_by_month.keys()):
-                cum_dep += gross_deposits_by_month.get(m, 0.0)
-                cum_wd += withdrawals_by_month[m]
-                if cum_wd > cum_dep:
-                    withdrawals_by_month[m] -= (cum_wd - cum_dep)
-                    cum_wd = cum_dep
-
         finally:
             temp_db.disconnect()
             try:
@@ -842,4 +794,4 @@ class RiskCalculator:
             except Exception:
                 pass
 
-        return history, deposits_by_month, cf_by_month, withdrawals_by_month
+        return history, deposits_by_month, cf_by_month
