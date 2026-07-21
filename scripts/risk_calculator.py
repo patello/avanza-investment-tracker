@@ -568,7 +568,13 @@ class RiskCalculator:
                     amt * (t_end - d).days / period_len for d, amt in flows
                 )
                 denominator = v_start + weighted_cf
-                if abs(denominator) > 0.01:
+                # Modified Dietz requires positive average capital. A negative
+                # denominator means withdrawals exceeded deposits on a time-
+                # weighted basis (e.g. a large withdrawal followed by a large
+                # transfer-in within the same period). The return is undefined
+                # in this case — set to 0 rather than producing a misleading
+                # value.
+                if denominator > 0.01:
                     r = (v_end - v_start - cf_total) / denominator
                 else:
                     r = 0.0
@@ -578,7 +584,7 @@ class RiskCalculator:
                 weighted_cf = sum(
                     amt * (t_end - d).days / period_len for d, amt in flows
                 )
-                if abs(weighted_cf) > 0.01:
+                if weighted_cf > 0.01:
                     r = (v_end - v_start - cf_total) / weighted_cf
                 else:
                     r = 0.0
@@ -798,6 +804,36 @@ class RiskCalculator:
             query_wd += " GROUP BY month"
             cur.execute(query_wd, params_wd)
             withdrawals_by_month = {row[0]: row[1] for row in cur.fetchall()}
+
+            # Query gross deposits (before withdrawal subtraction) for the
+            # withdrawal cap below.
+            query_gd = "SELECT month, SUM(deposit) FROM cohort_data"
+            params_gd = []
+            if self.cohorts_start or self.cohorts_end:
+                query_gd += " WHERE 1=1"
+                if self.cohorts_start:
+                    query_gd += " AND month >= ?"
+                    params_gd.append(self.cohorts_start.isoformat())
+                if self.cohorts_end:
+                    query_gd += " AND month <= ?"
+                    params_gd.append(self.cohorts_end.isoformat())
+            query_gd += " GROUP BY month"
+            cur.execute(query_gd, params_gd)
+            gross_deposits_by_month = {row[0]: row[1] for row in cur.fetchall()}
+
+            # Cap cumulative withdrawals at cumulative gross deposits. The
+            # cohort system's FIFO accounting can record withdrawals that
+            # draw from pre-cohort capital, producing negative Modified Dietz
+            # denominators. Capping ensures a cohort never withdraws more
+            # than was deposited into it.
+            cum_dep = 0.0
+            cum_wd = 0.0
+            for m in sorted(withdrawals_by_month.keys()):
+                cum_dep += gross_deposits_by_month.get(m, 0.0)
+                cum_wd += withdrawals_by_month[m]
+                if cum_wd > cum_dep:
+                    withdrawals_by_month[m] -= (cum_wd - cum_dep)
+                    cum_wd = cum_dep
 
         finally:
             temp_db.disconnect()
