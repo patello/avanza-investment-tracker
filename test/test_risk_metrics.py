@@ -91,30 +91,35 @@ def test_risk_calculator_metrics(mock_get, risk_scenario_db):
     # 2020-02-29 (t_2): 100 shares * 121 = 12100
     # 2020-03-31 (t_3): 100 shares * 96.8 = 9680
     
-    # Cash flow in period 1: 10000 (deposit on Jan 15)
-    # Return 1: (11000 - 0 - 10000) / 0 -> 0.0
-    # Return 2: (12100 - 11000 - 0) / 11000 -> 0.10 (10%)
-    # Return 3: (9680 - 12100 - 0) / 12100 -> -0.20 (-20%)
-    # Returns series: [0.0, 0.10, -0.20]
+    # Cash flow: 10000 deposit on 2020-01-15 (period 1 only)
+    #
+    # Modified Dietz returns:
+    # Period 1 (31 days): v_start=0, v_end=11000, cf=10000 on Jan 15
+    #   weighted_cf = 10000 * (Jan31 - Jan15) / 31 = 10000 * 16/31
+    #   r1 = (11000 - 0 - 10000) / (10000 * 16/31) = 1000 / 5161.29 = 0.19375
+    # Period 2 (29 days): v_start=11000, v_end=12100, cf=0
+    #   r2 = (12100 - 11000) / 11000 = 0.10
+    # Period 3 (31 days): v_start=12100, v_end=9680, cf=0
+    #   r3 = (9680 - 12100) / 12100 = -0.20
+    # Returns series: [0.19375, 0.10, -0.20]
     
-    # Mean of returns: (0.0 + 0.10 - 0.20) / 3 = -0.033333 (-3.33%)
-    # Variance: ((0 - (-0.033333))**2 + (0.10 - (-0.033333))**2 + (-0.20 - (-0.033333))**2) / 2
-    # Variance = (0.001111 + 0.017778 + 0.027778) / 2 = 0.046667 / 2 = 0.023333
-    # Monthly Stddev = sqrt(0.023333) = 0.152753
-    # Annualized Stddev = 0.152753 * sqrt(12) = 0.529150 (52.92%)
+    # Mean of returns: (0.19375 + 0.10 - 0.20) / 3 = 0.03125
+    # Variance: ((0.1625)^2 + (0.06875)^2 + (-0.23125)^2) / 2 = 0.042305
+    # Monthly Stddev = sqrt(0.042305) = 0.20568
+    # Annualized Stddev = 0.20568 * sqrt(12) = 0.7125
     
     # Sharpe Ratio:
     # risk_free_rate = 0.02
     # overall_return = -0.1451 (-14.51%) supplied by caller
-    # Sharpe = (-0.1451 - 0.02) / 0.529150 = -0.3120
+    # Sharpe = (-0.1451 - 0.02) / 0.7125 = -0.2317
     
     # Max Drawdown:
-    # Peak = 12100
-    # Trough = 9680
-    # Max Drawdown = (12100 - 9680) / 12100 = 0.20 (20%)
+    # Cumulative index: [1.0, 1.19375, 1.3131, 1.0505]
+    # Peak = 1.3131 at Feb 29, Trough = 1.0505 at Mar 31
+    # Max Drawdown = (1.3131 - 1.0505) / 1.3131 = 0.20 (20%)
     
-    assert abs(metrics['annualized_stddev'] - 0.52915) < 0.001
-    assert abs(metrics['sharpe_ratio'] - (-0.3120)) < 0.01
+    assert abs(metrics['annualized_stddev'] - 0.7125) < 0.001
+    assert abs(metrics['sharpe_ratio'] - (-0.2317)) < 0.01
     assert abs(metrics['max_drawdown'] - 0.20) < 0.001
     assert metrics['max_drawdown_peak'] == date(2020, 2, 29)
     assert metrics['max_drawdown_trough'] == date(2020, 3, 31)
@@ -145,7 +150,7 @@ def test_riksbanken_rate_fallback(mock_get, risk_scenario_db):
     
     # Should fall back to 2.0%
     assert metrics['risk_free_rate'] == 0.02
-    assert abs(metrics['sharpe_ratio'] - (-0.3120)) < 0.01
+    assert abs(metrics['sharpe_ratio'] - (-0.2317)) < 0.01
 
 
 @patch("scripts.risk_calculator.requests.get")
@@ -193,22 +198,21 @@ def test_beta_calculation(mock_get, risk_scenario_db):
     
     metrics = calculator.calculate(portfolio_apy=-0.1451)
     
-    # Port returns: [0.0, 0.10, -0.20], mean: -0.033333
+    # Port returns (Modified Dietz): [0.19375, 0.10, -0.20], mean: 0.03125
     # Bench returns: [0.05, 0.05, -0.10], mean: 0.0
     
     # Covariance:
-    # ((0 - (-0.033333)) * (0.05 - 0) + (0.10 - (-0.033333)) * (0.05 - 0) + (-0.20 - (-0.033333)) * (-0.10 - 0)) / 2
-    # = (0.033333 * 0.05 + 0.133333 * 0.05 + (-0.166667) * (-0.10)) / 2
-    # = (0.001667 + 0.006667 + 0.016667) / 2 = 0.025 / 2 = 0.0125
+    # ((0.19375 - 0.03125) * 0.05 + (0.10 - 0.03125) * 0.05 + (-0.20 - 0.03125) * (-0.10)) / 2
+    # = (0.008125 + 0.0034375 + 0.023125) / 2 = 0.01734375
     
     # Var(bench):
     # ((0.05 - 0)**2 + (0.05 - 0)**2 + (-0.10 - 0)**2) / 2
-    # = (0.0025 + 0.0025 + 0.01) / 2 = 0.015 / 2 = 0.0075
+    # = (0.0025 + 0.0025 + 0.01) / 2 = 0.0075
     
-    # Beta = Covariance / Var(bench) = 0.0125 / 0.0075 = 1.6667
+    # Beta = Covariance / Var(bench) = 0.01734375 / 0.0075 = 2.3125
     
     assert metrics['beta'] is not None
-    assert abs(metrics['beta'] - 1.6667) < 0.01
+    assert abs(metrics['beta'] - 2.3125) < 0.01
 
 
 @pytest.fixture
@@ -266,9 +270,24 @@ def cf_dominated_scenario_db(tmp_path):
 
 
 @patch("scripts.risk_calculator.requests.get")
-def test_cf_dominated_period_is_excluded(mock_get, cf_dominated_scenario_db):
-    """Regression test for task #2: a cf-dominated first period must not
-    produce impossible (< -100%) drawdowns or implausibly large stddev."""
+def test_modified_dietz_handles_cash_flow_dominated_period(mock_get, cf_dominated_scenario_db):
+    """Regression test: a large cash flow into a small starting balance must
+    not produce an impossible return. Modified Dietz time-weights the cash
+    flow so the return stays bounded.
+
+    Scenario (from cf_dominated_scenario_db):
+      2020-01-15: Deposit 100, buy 1 share @ 100
+      2020-02-10: Deposit 10000 (cash, no purchase)
+      Prices:     Jan 31 = 100, Feb 29 = 50, Mar 31 = 55
+
+    Period 2 (Jan 31 -> Feb 29, 29 days):
+      v_start = 100 (1 share @ 100)
+      v_end   = 10050 (1 share @ 50 + 10000 cash)
+      cf      = 10000 on Feb 10 (19 days before period end)
+      Simple Dietz:   r = (10050 - 100 - 10000) / 100 = -50% (misleading)
+      Modified Dietz: weighted_cf = 10000 * 19/29 = 6551.72
+                      r = (10050 - 100 - 10000) / (100 + 6551.72) = -0.75%
+    """
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = [{"date": "2020-03-01", "value": 2.0}]
@@ -284,69 +303,11 @@ def test_cf_dominated_period_is_excluded(mock_get, cf_dominated_scenario_db):
     )
     metrics = calculator.calculate(portfolio_apy=-0.5)
 
-    # The drawdown is mathematically capped at -100%; the cf-dominated
-    # first period (r=-500%) must be excluded so we never report below that.
+    # Modified Dietz keeps the return bounded; no impossible drawdowns.
     assert metrics['max_drawdown'] <= 1.0, "max_drawdown must be <= 100%"
     assert metrics['max_drawdown'] >= 0.0, "max_drawdown must be non-negative"
-
-    # With the blow-up period excluded, the only reliable period is
-    # Feb 29 -> Mar 31: v_start=10050, v_end=10055, cf=0, r=5/10050 ~= 0.000497
-    # Stddev of a single reliable return is 0 (n=1 < 2 => stddev=0 per code).
-    assert metrics['annualized_stddev'] < 1.0, (
-        f"stddev should be small after excluding cf-dominated period, "
+    # Stddev must be plausible (the old simple-Dietz -50% outlier is gone).
+    assert metrics['annualized_stddev'] < 0.1, (
+        f"stddev should be small with Modified Dietz, "
         f"got {metrics['annualized_stddev']}"
     )
-
-
-@patch("scripts.risk_calculator.requests.get")
-def test_delayed_pricing_period_is_excluded(mock_get, tmp_path):
-    """Regression test for the magnitude filter: a period whose return is
-    outside the plausible range (|r| > 1.0, e.g. an asset that more than
-    doubles in one month — a hallmark of a delayed-pricing artifact where an
-    asset was bought but unpriced at the previous period boundary) must be
-    excluded from the risk metrics."""
-    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
-2020-01-15;1111;Insättning;Deposit;-;-;100;0;SEK;;-
-2020-01-16;1111;Köp;Asset A;1;100;-100;0;SEK;TESTA;-
-"""
-    csv_file = tmp_path / "delayed_pricing.csv"
-    csv_file.write_text(csv_content, encoding="utf-8")
-
-    db_file = tmp_path / "test_delayed_pricing.db"
-    db = DatabaseHandler(db_file)
-    parser = DataParser(db)
-    parser.add_data(str(csv_file))
-    parser.process_transactions()
-
-    # Price jumps from 100 -> 250 (r=+150%) in Feb, then holds.
-    db.connect()
-    cur = db.get_cursor()
-    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-01-31', 100.0, 'external')")
-    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-02-29', 250.0, 'external')")
-    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-03-31', 250.0, 'external')")
-    db.commit()
-    db.disconnect()
-
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = [{"date": "2020-03-01", "value": 2.0}]
-    mock_get.return_value = mock_resp
-
-    calculator = RiskCalculator(
-        db=db,
-        accounts="1111",
-        from_date="2020-01-01",
-        to_date="2020-03-31",
-        beta_ticker=None,
-        interpolate=True,
-    )
-    metrics = calculator.calculate(portfolio_apy=0.05)
-
-    # The +150% return period is excluded by the magnitude filter; only the
-    # placeholder (r=0) and the flat Mar period (r=0) remain, so stddev is 0
-    # and there is no drawdown.
-    assert metrics['annualized_stddev'] < 0.001, (
-        f"stddev should be ~0 after excluding the |r|>1 period, "
-        f"got {metrics['annualized_stddev']}"
-    )
-    assert metrics['max_drawdown'] < 0.001

@@ -428,7 +428,10 @@ class RiskCalculator:
                         asset_value += shares * price
             portfolio_values.append(cash + asset_value)
 
-        # 3b. Trim leading zero-value months (common when evaluating specific cohorts or recently opened accounts)
+        # 3b. Trim leading zero-value months (common when evaluating specific
+        # cohorts or recently opened accounts). Cash flows that predate the
+        # new start are reassigned to the first period (section 4) so they
+        # are not lost.
         first_val_idx = None
         for idx, val in enumerate(portfolio_values):
             if val > 0.01:
@@ -439,102 +442,139 @@ class RiskCalculator:
             sampling_dates = sampling_dates[start_slice:]
             portfolio_values = portfolio_values[start_slice:]
 
-        # 4. Fetch daily cash flows
+        # 4. Fetch cash flows as (date, amount) pairs, using ACTUAL
+        #    transaction dates for Modified Dietz time-weighting.
+        #    For cohorts, membership is determined by allocation month
+        #    (transactions in the first 10 days of a month are allocated
+        #    to the previous month), but the cash flow DATE must be the
+        #    actual transaction date — using the allocation month would
+        #    place cash flows in the wrong sampling period.
         from collections import defaultdict
+        import calendar as _cal
         cash_flows_by_date = defaultdict(float)
-        
-        if self.cohorts_start is not None or self.cohorts_end is not None:
-            # Cohort-specific cash flows (from cohort tables)
-            for m_str, dep in deposits_by_month.items():
-                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-                cash_flows_by_date[m_date] += dep
-                
-            for m_str, cf in cf_by_month.items():
-                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
-                cash_flows_by_date[m_date] += cf
-        else:
-            # Full portfolio cash flows (query from raw transactions)
-            if accounts_list:
-                placeholders = ",".join("?" for _ in accounts_list)
-                query = f"""
-                    SELECT date, transaction_type, total, amount, price 
-                    FROM transactions 
-                    WHERE date > ? AND date <= ? AND account IN ({placeholders})
-                """
-                params = [sampling_dates[0].isoformat(), to_date.isoformat()] + accounts_list
-            else:
-                query = """
-                    SELECT date, transaction_type, total, amount, price 
-                    FROM transactions 
-                    WHERE date > ? AND date <= ?
-                """
-                params = [sampling_dates[0].isoformat(), to_date.isoformat()]
-                
-            cur.execute(query, params)
-            tx_rows = cur.fetchall()
-            
-            for date_str, tx_type, total, amount, price in tx_rows:
-                if isinstance(date_str, str):
-                    tx_date = datetime_cls.strptime(date_str, "%Y-%m-%d").date()
-                else:
-                    tx_date = date_str
-                    
-                if tx_type in ("Insättning", "Autogiroinsättning", "Uttag", "Intern överföring"):
-                    cash_flows_by_date[tx_date] += total
-                elif tx_type == "Tillgångsinsättning":
-                    cash_flows_by_date[tx_date] += amount * price
 
-        cash_flows = []
+        def _alloc_month(tx_date):
+            """Replicate data_parser.allocate_to_month for cohort filtering."""
+            cutoff = 10
+            y, m, d = tx_date.year, tx_date.month, tx_date.day
+            if d <= cutoff:
+                if m > 1:
+                    m -= 1
+                else:
+                    m, y = 12, y - 1
+            return date(y, m, _cal.monthrange(y, m)[1])
+
+        # Build the raw-transaction query (shared by both paths)
+        if accounts_list:
+            placeholders = ",".join("?" for _ in accounts_list)
+            query = (f"SELECT date, transaction_type, total, amount, price "
+                     f"FROM transactions "
+                     f"WHERE date > ? AND date <= ? AND account IN ({placeholders})")
+            params = [sampling_dates[0].isoformat(), to_date.isoformat()] + accounts_list
+        else:
+            query = ("SELECT date, transaction_type, total, amount, price "
+                     "FROM transactions WHERE date > ? AND date <= ?")
+            params = [sampling_dates[0].isoformat(), to_date.isoformat()]
+
+        cur.execute(query, params)
+
+        for date_str, tx_type, total, amount, price in cur.fetchall():
+            if isinstance(date_str, str):
+                tx_date = datetime_cls.strptime(date_str, "%Y-%m-%d").date()
+            else:
+                tx_date = date_str
+
+            # For cohort mode, only include transactions whose allocation
+            # month falls within the cohort range.
+            if self.cohorts_start is not None or self.cohorts_end is not None:
+                am = _alloc_month(tx_date)
+                if self.cohorts_start is not None and am < self.cohorts_start:
+                    continue
+                if self.cohorts_end is not None and am > self.cohorts_end:
+                    continue
+
+            if tx_type in ("Insättning", "Autogiroinsättning", "Uttag", "Intern överföring"):
+                cash_flows_by_date[tx_date] += total
+            elif tx_type == "Tillgångsinsättning":
+                cash_flows_by_date[tx_date] += amount * price
+
+        # Cohort-specific non-deposit cash flows (dividends, fees, taxes) from
+        # cohort_cash_flows. These are tiny amounts stored by allocation month;
+        # mid-month approximation is adequate for Modified Dietz weighting.
+        if self.cohorts_start is not None or self.cohorts_end is not None:
+            for m_str, cf_amt in cf_by_month.items():
+                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
+                cf_date = date(m_date.year, m_date.month, 15)
+                cash_flows_by_date[cf_date] += cf_amt
+
+        # Assign cash flows to sampling periods, keeping (date, amount) pairs
+        # for Modified Dietz time-weighting.
+        period_cash_flows = []  # per period: list of (date, amount)
         for i in range(1, len(sampling_dates)):
             t_start = sampling_dates[i-1]
             t_end = sampling_dates[i]
-            period_cf = 0.0
+            flows = []
             for d, cf in cash_flows_by_date.items():
                 if i == 1:
                     if t_start <= d <= t_end:
-                        period_cf += cf
+                        flows.append((d, cf))
                 else:
                     if t_start < d <= t_end:
-                        period_cf += cf
-            cash_flows.append(period_cf)
+                        flows.append((d, cf))
+            period_cash_flows.append(flows)
 
-        # 5. Compute monthly returns
-        # A period's simple-Dietz return is only meaningful when (a) the
-        # starting value is material relative to the period's cash flow, and
-        # (b) the resulting return is within a plausible range. When a large
-        # deposit/withdrawal hits a small starting balance (common for the
-        # first period of a freshly-funded cohort), or when an asset is
-        # purchased but unpriced at the period boundary (so it contributes 0
-        # to v at the start and a non-zero value next period once a price
-        # appears), (v_end - v_start - cf) / v_start explodes and pollutes
-        # stddev, Sharpe, and the cumulative drawdown index. Such periods are
-        # flagged unreliable and excluded from the return-based risk metrics.
-        MATERIALITY = 0.5
-        MAX_PLAUSIBLE_RETURN = 1.0
+        # Cash flows that predate the first sampling date (e.g. deposits
+        # allocated to a month before the leading-zero trim point) are
+        # reassigned to the first period with the start date as their
+        # effective date, giving them a time weight of 1.0 (invested for
+        # the full period). This prevents the trim from losing cash flows.
+        if period_cash_flows:
+            for d, cf in cash_flows_by_date.items():
+                if d < sampling_dates[0]:
+                    period_cash_flows[0].append((sampling_dates[0], cf))
+
+        # Per-period cash-flow totals (used by year_returns in section 11).
+        cash_flows = [sum(amt for _, amt in flows) for flows in period_cash_flows]
+
+        # 5. Compute monthly returns using Modified Dietz.
+        #    r = (v_end - v_start - cf_total) / (v_start + Σ(w_i · cf_i))
+        #    where w_i = (t_end - d_i) / (t_end - t_start) time-weights each
+        #    cash flow by how much of the period it was invested. This handles
+        #    large cash flows into small balances gracefully (the original
+        #    simple-Dietz formula exploded when cf dominated v_start).
         returns = []
-        reliable = []
         for i in range(1, len(sampling_dates)):
             v_start = portfolio_values[i-1]
             v_end = portfolio_values[i]
-            cf = cash_flows[i-1]
+            flows = period_cash_flows[i-1]
+            t_start = sampling_dates[i-1]
+            t_end = sampling_dates[i]
+            period_len = (t_end - t_start).days
 
-            if v_start > 0.01:
-                r = (v_end - v_start - cf) / v_start
-                is_reliable = (
-                    v_start >= MATERIALITY * abs(cf)
-                    and abs(r) <= MAX_PLAUSIBLE_RETURN
+            cf_total = sum(amt for _, amt in flows)
+
+            if v_start > 0.01 and period_len > 0:
+                weighted_cf = sum(
+                    amt * (t_end - d).days / period_len for d, amt in flows
                 )
+                denominator = v_start + weighted_cf
+                if abs(denominator) > 0.01:
+                    r = (v_end - v_start - cf_total) / denominator
+                else:
+                    r = 0.0
+            elif period_len > 0 and v_start <= 0.01:
+                # Leading period with no starting capital: use weighted cf
+                # as the denominator (all return is on the deposited capital).
+                weighted_cf = sum(
+                    amt * (t_end - d).days / period_len for d, amt in flows
+                )
+                if abs(weighted_cf) > 0.01:
+                    r = (v_end - v_start - cf_total) / weighted_cf
+                else:
+                    r = 0.0
             else:
-                # Leading placeholder period (no invested capital yet); the
-                # zero return is harmless and keeps period_start anchored.
                 r = 0.0
-                is_reliable = True
             returns.append(r)
-            reliable.append(is_reliable)
-
-        # Returns used for variance / Sharpe / Sortino / drawdown index.
-        reliable_returns = [r for r, ok in zip(returns, reliable) if ok]
-        reliable_idx = [i for i, ok in enumerate(reliable) if ok]
 
         # 6. Fetch Risk-Free Rate
         rf_rate = fetch_riksbanken_rate(from_date, to_date)
@@ -543,56 +583,51 @@ class RiskCalculator:
         # metrics use the same APY figure that is displayed in the stats table.
         overall_return = portfolio_apy
 
-        # 8. Calculate risk metrics (from reliable returns only)
-        n = len(reliable_returns)
+        # 8. Calculate risk metrics
+        n = len(returns)
         if n < 2:
             annualized_stddev = 0.0
             sharpe = 0.0
             sortino = 0.0
         else:
-            mean_r = sum(reliable_returns) / n
-            variance = sum((r - mean_r) ** 2 for r in reliable_returns) / (n - 1)
+            mean_r = sum(returns) / n
+            variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
             stddev = math.sqrt(variance)
             annualized_stddev = stddev * math.sqrt(12)
-            
+
             if annualized_stddev > 0.0001:
                 sharpe = (overall_return - rf_rate) / annualized_stddev
             else:
                 sharpe = 0.0
-                
+
             rf_monthly = rf_rate / 12.0
-            downside_diffs = [min(r - rf_monthly, 0.0) for r in reliable_returns]
+            downside_diffs = [min(r - rf_monthly, 0.0) for r in returns]
             downside_variance = sum(diff ** 2 for diff in downside_diffs) / (n - 1)
             downside_stddev = math.sqrt(downside_variance)
             annualized_downside_stddev = downside_stddev * math.sqrt(12)
-            
+
             if annualized_downside_stddev > 0.0001:
                 sortino = (overall_return - rf_rate) / annualized_downside_stddev
             else:
                 sortino = 0.0
 
-        # 9. Maximum Drawdown (cumulative return index built from reliable
-        # returns only; the index holds — does not update — during unreliable
-        # periods, so a cf-dominated period cannot inject a spurious -100%+ move.
-        # The index is floored at a tiny positive value so drawdown is always
-        # strictly less than 100%, even if a genuine near-total-loss return
-        # occurs in a reliable period.)
+        # 9. Maximum Drawdown (cumulative return index). The index is floored
+        # at a tiny positive value as a safety net so drawdown is always
+        # strictly less than 100%.
         max_dd = 0.0
         peak = 1.0
         peak_date = sampling_dates[0]
         trough_date = None
         current_peak_date = sampling_dates[0]
-        
+
         index_value = 1.0
         index_points = [(sampling_dates[0], 1.0)]
         for i, r in enumerate(returns):
-            if not reliable[i]:
-                continue
             index_value *= (1.0 + r)
             if index_value < 1e-9:
                 index_value = 1e-9
             index_points.append((sampling_dates[i+1], index_value))
-        
+
         for dt, val in index_points:
             if val > peak:
                 peak = val
@@ -619,17 +654,14 @@ class RiskCalculator:
                     else:
                         r_bench = 0.0
                     bench_returns.append(r_bench)
-                    
-                # Align beta computation to reliable periods only
-                port_r = [returns[i] for i in reliable_idx]
-                bench_r = [bench_returns[i] for i in reliable_idx]
-                if len(port_r) >= 2:
-                    mean_bench = sum(bench_r) / len(bench_r)
-                    mean_port = sum(port_r) / len(port_r)
-                    
-                    covariance = sum((r_p - mean_port) * (r_b - mean_bench) for r_p, r_b in zip(port_r, bench_r)) / (len(port_r) - 1)
-                    variance_bench = sum((r_b - mean_bench) ** 2 for r_b in bench_r) / (len(bench_r) - 1)
-                    
+
+                if len(returns) >= 2 and len(bench_returns) >= 2:
+                    mean_bench = sum(bench_returns) / len(bench_returns)
+                    mean_port = sum(returns) / len(returns)
+
+                    covariance = sum((r_p - mean_port) * (r_b - mean_bench) for r_p, r_b in zip(returns, bench_returns)) / (len(returns) - 1)
+                    variance_bench = sum((r_b - mean_bench) ** 2 for r_b in bench_returns) / (len(bench_returns) - 1)
+
                     if variance_bench > 1e-8:
                         beta = covariance / variance_bench
 
@@ -710,7 +742,7 @@ class RiskCalculator:
             # Query cohort-specific deposits and cash flows
             cur = temp_db.get_cursor()
             
-            query_dep = "SELECT month, SUM(deposit) FROM cohort_data"
+            query_dep = "SELECT month, SUM(deposit) - COALESCE(SUM(withdrawal), 0) FROM cohort_data"
             params_dep = []
             if self.cohorts_start or self.cohorts_end:
                 query_dep += " WHERE 1=1"

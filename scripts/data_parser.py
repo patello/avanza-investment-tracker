@@ -303,7 +303,7 @@ class DataParser:
     
     def reset_processed_transactions(self) -> None:
         """
-        Resets the processed flag for all transactions in the database. Also resets cohort_data, cohort_assets, assets and cohort_cash_flows tables.
+        Resets the processed flag for all transactions in the database. Also resets cohort_data, cohort_assets, assets, cohort_cash_flows and asset_prices tables.
         """
         self.data_cur.execute("UPDATE transactions SET processed = 0")
         self.db.reset_table("cohort_data")
@@ -311,6 +311,22 @@ class DataParser:
         self.db.reset_table("assets")
         self.db.reset_table("cohort_cash_flows")
         self.db.reset_table("asset_prices")
+        self.db.commit()
+
+    def reset_for_reprocessing(self) -> None:
+        """
+        Reset cohort tables and the processed flag so the next
+        ``process_transactions`` call performs a full clean rebuild.
+
+        Unlike ``reset_processed_transactions`` this preserves the
+        ``asset_prices`` table so that externally-fetched historical prices
+        are not wiped out on every import.
+        """
+        self.data_cur.execute("UPDATE transactions SET processed = 0")
+        self.db.reset_table("cohort_data")
+        self.db.reset_table("cohort_assets")
+        self.db.reset_table("assets")
+        self.db.reset_table("cohort_cash_flows")
         self.db.commit()
 
     def allocate_to_month(self, transaction_date: date) -> date:
@@ -513,8 +529,9 @@ class DataParser:
         price = row[5]
         total_amount = -row[6]
         date = row[0]
-        self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
-        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
+        if price > 0:
+            self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+            self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         remaining_amount = total_amount
         month_capital = self.available_capital(account)
         total_capital = sum(e[1] for e in month_capital)
@@ -553,8 +570,9 @@ class DataParser:
         price = row[5]
         total_amount = row[6]
         date = row[0]
-        self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
-        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
+        if price > 0:
+            self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+            self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         remaining_amount = asset_amount
         month_asset_amounts = self.available_asset(asset_id, account)
 
@@ -745,8 +763,13 @@ class DataParser:
                 logging.info(f"Resolved missing price for {asset} on {date} using get_price ({price} {desc})")
                 self.data_cur.execute("UPDATE transactions SET price = ? WHERE rowid = ?", (price, row[-1]))
 
-        self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
-        self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
+        # Only record a price point if we have a usable (> 0) price, so that
+        # an unresolved deposit does not poison asset_prices / latest_price
+        # with a literal 0.0 that would cause the asset to be silently valued
+        # at zero until a real price appears.
+        if price > 0:
+            self.data_cur.execute("UPDATE assets SET latest_price = ?, latest_price_date = ? WHERE asset_id = ?", (price, date, asset_id))
+            self.data_cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (?, ?, ?, 'transaction')", (asset_id, date, price))
         self.data_cur.execute("INSERT OR IGNORE INTO cohort_assets(month,asset_id,account) VALUES (?,?,?)",(month,asset_id,account))
         # Update average price and average purchase price
         self.data_cur.execute("UPDATE cohort_assets SET average_price = (? * ? + amount * average_price) / (amount + ?) WHERE month = ? AND asset_id = ? AND account = ?", (amount, price, amount, month, asset_id, account))

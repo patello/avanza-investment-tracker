@@ -112,6 +112,11 @@ def import_data(args):
         rows_added = data_parser.add_data(args.file)
         logging.info(f"Added {rows_added} rows to the database")
         
+        # Reset cohort tables (preserving asset_prices) so every import is a
+        # clean rebuild — prevents stale cohort_assets entries from surviving
+        # across imports with different transaction data.
+        data_parser.reset_for_reprocessing()
+        
         # Process transactions
         data_parser.process_transactions()
         logging.info("Transactions processed")
