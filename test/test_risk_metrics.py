@@ -4,7 +4,16 @@ from datetime import date
 from unittest.mock import patch, MagicMock
 from database_handler import DatabaseHandler
 from data_parser import DataParser
-from scripts.risk_calculator import RiskCalculator, generate_monthly_dates
+from scripts.risk_calculator import RiskCalculator, generate_monthly_dates, clear_riksbanken_cache
+
+
+@pytest.fixture(autouse=True)
+def _clear_rate_cache():
+    """Clear the Riksbanken rate cache between tests so mocked requests.get
+    call counts are deterministic."""
+    clear_riksbanken_cache()
+    yield
+    clear_riksbanken_cache()
 
 
 @pytest.fixture
@@ -74,7 +83,7 @@ def test_risk_calculator_metrics(mock_get, risk_scenario_db):
         interpolate=True
     )
     
-    metrics = calculator.calculate(apy_mode='mwrr')
+    metrics = calculator.calculate(portfolio_apy=-0.1451)
     
     # Portfolio values at:
     # 2019-12-31 (t_0): 0
@@ -96,7 +105,7 @@ def test_risk_calculator_metrics(mock_get, risk_scenario_db):
     
     # Sharpe Ratio:
     # risk_free_rate = 0.02
-    # overall_return = -0.1451 (-14.51%)
+    # overall_return = -0.1451 (-14.51%) supplied by caller
     # Sharpe = (-0.1451 - 0.02) / 0.529150 = -0.3120
     
     # Max Drawdown:
@@ -132,7 +141,7 @@ def test_riksbanken_rate_fallback(mock_get, risk_scenario_db):
         interpolate=True
     )
     
-    metrics = calculator.calculate(apy_mode='mwrr')
+    metrics = calculator.calculate(portfolio_apy=-0.1451)
     
     # Should fall back to 2.0%
     assert metrics['risk_free_rate'] == 0.02
@@ -182,7 +191,7 @@ def test_beta_calculation(mock_get, risk_scenario_db):
         interpolate=True
     )
     
-    metrics = calculator.calculate(apy_mode='mwrr')
+    metrics = calculator.calculate(portfolio_apy=-0.1451)
     
     # Port returns: [0.0, 0.10, -0.20], mean: -0.033333
     # Bench returns: [0.05, 0.05, -0.10], mean: 0.0
@@ -200,3 +209,144 @@ def test_beta_calculation(mock_get, risk_scenario_db):
     
     assert metrics['beta'] is not None
     assert abs(metrics['beta'] - 1.6667) < 0.01
+
+
+@pytest.fixture
+def cf_dominated_scenario_db(tmp_path):
+    """
+    Scenario that reproduces the cf-dominated first-period blow-up (task #2/#71):
+
+    - 2020-01-15: Small deposit 100 SEK (buys 1 share at 100 SEK)
+    - 2020-02-15: Large deposit 10000 SEK (sits as cash — no asset purchase)
+    - Prices: 100 (Jan 31), 100 (Feb 29), 110 (Mar 31)
+
+    Without the unreliable-period filter, period 1 (Jan 31 -> Feb 29) has:
+        v_start = 100 (1 share @ 100)
+        v_end   = 10100 (1 share @ 100 + 10000 cash)
+        cf      = 10000
+        r       = (10100 - 100 - 10000) / 100 = 0.0   (actually fine here)
+
+    To force a blow-up we make the second deposit hit before the asset is revalued
+    and make the first deposit tiny relative to the second:
+        - 2020-01-15: Deposit 100, buy 1 share @ 100
+        - 2020-02-10: Deposit 10000 (cash)
+        - 2020-02-29 price = 50 (asset drops)
+    Period 1 (Jan 31 -> Feb 29):
+        v_start = 100 (1 share @ 100)
+        v_end   = 10050 (1 share @ 50 + 10000 cash)
+        cf      = 10000
+        r       = (10050 - 100 - 10000) / 100 = -5.0  (-500%)
+    This -500% return would make max_drawdown < -100% and stddev ~huge.
+    After the fix, this period is flagged unreliable (v_start=100 < 0.5*10000=5000)
+    and excluded from risk metrics.
+    """
+    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
+2020-01-15;1111;Insättning;Deposit;-;-;100;0;SEK;;-
+2020-01-16;1111;Köp;Asset A;1;100;-100;0;SEK;TESTA;-
+2020-02-10;1111;Insättning;Deposit;-;-;10000;0;SEK;;-
+"""
+    csv_file = tmp_path / "cf_dominated.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    db_file = tmp_path / "test_cf_dominated.db"
+    db = DatabaseHandler(db_file)
+    parser = DataParser(db)
+    parser.add_data(str(csv_file))
+    parser.process_transactions()
+
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-01-31', 100.0, 'external')")
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-02-29', 50.0, 'external')")
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-03-31', 55.0, 'external')")
+    db.commit()
+    db.disconnect()
+
+    return db
+
+
+@patch("scripts.risk_calculator.requests.get")
+def test_cf_dominated_period_is_excluded(mock_get, cf_dominated_scenario_db):
+    """Regression test for task #2: a cf-dominated first period must not
+    produce impossible (< -100%) drawdowns or implausibly large stddev."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [{"date": "2020-03-01", "value": 2.0}]
+    mock_get.return_value = mock_resp
+
+    calculator = RiskCalculator(
+        db=cf_dominated_scenario_db,
+        accounts="1111",
+        from_date="2020-01-01",
+        to_date="2020-03-31",
+        beta_ticker=None,
+        interpolate=True,
+    )
+    metrics = calculator.calculate(portfolio_apy=-0.5)
+
+    # The drawdown is mathematically capped at -100%; the cf-dominated
+    # first period (r=-500%) must be excluded so we never report below that.
+    assert metrics['max_drawdown'] <= 1.0, "max_drawdown must be <= 100%"
+    assert metrics['max_drawdown'] >= 0.0, "max_drawdown must be non-negative"
+
+    # With the blow-up period excluded, the only reliable period is
+    # Feb 29 -> Mar 31: v_start=10050, v_end=10055, cf=0, r=5/10050 ~= 0.000497
+    # Stddev of a single reliable return is 0 (n=1 < 2 => stddev=0 per code).
+    assert metrics['annualized_stddev'] < 1.0, (
+        f"stddev should be small after excluding cf-dominated period, "
+        f"got {metrics['annualized_stddev']}"
+    )
+
+
+@patch("scripts.risk_calculator.requests.get")
+def test_delayed_pricing_period_is_excluded(mock_get, tmp_path):
+    """Regression test for the magnitude filter: a period whose return is
+    outside the plausible range (|r| > 1.0, e.g. an asset that more than
+    doubles in one month — a hallmark of a delayed-pricing artifact where an
+    asset was bought but unpriced at the previous period boundary) must be
+    excluded from the risk metrics."""
+    csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
+2020-01-15;1111;Insättning;Deposit;-;-;100;0;SEK;;-
+2020-01-16;1111;Köp;Asset A;1;100;-100;0;SEK;TESTA;-
+"""
+    csv_file = tmp_path / "delayed_pricing.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    db_file = tmp_path / "test_delayed_pricing.db"
+    db = DatabaseHandler(db_file)
+    parser = DataParser(db)
+    parser.add_data(str(csv_file))
+    parser.process_transactions()
+
+    # Price jumps from 100 -> 250 (r=+150%) in Feb, then holds.
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-01-31', 100.0, 'external')")
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-02-29', 250.0, 'external')")
+    cur.execute("INSERT OR REPLACE INTO asset_prices (asset_id, price_date, price, source) VALUES (1, '2020-03-31', 250.0, 'external')")
+    db.commit()
+    db.disconnect()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [{"date": "2020-03-01", "value": 2.0}]
+    mock_get.return_value = mock_resp
+
+    calculator = RiskCalculator(
+        db=db,
+        accounts="1111",
+        from_date="2020-01-01",
+        to_date="2020-03-31",
+        beta_ticker=None,
+        interpolate=True,
+    )
+    metrics = calculator.calculate(portfolio_apy=0.05)
+
+    # The +150% return period is excluded by the magnitude filter; only the
+    # placeholder (r=0) and the flat Mar period (r=0) remain, so stddev is 0
+    # and there is no drawdown.
+    assert metrics['annualized_stddev'] < 0.001, (
+        f"stddev should be ~0 after excluding the |r|>1 period, "
+        f"got {metrics['annualized_stddev']}"
+    )
+    assert metrics['max_drawdown'] < 0.001

@@ -436,6 +436,55 @@ def print_risk_metrics_table(risk_metrics, beta_ticker=None):
         print(f"Beta vs {ticker}:         {risk_metrics['beta']:.2f}")
 
 
+def cohort_bounds(cohort_month, period):
+    """Return (cohorts_start, cohorts_end) for a single cohort given its
+    representative month-end date and the grouping period ('year' or 'month').
+    """
+    import calendar
+    if hasattr(cohort_month, 'year') and hasattr(cohort_month, 'month'):
+        y, m = cohort_month.year, cohort_month.month
+        if period == "year":
+            return date(y, 1, 1), date(y, 12, 31)
+        last = calendar.monthrange(y, m)[1]
+        return date(y, m, 1), date(y, m, last)
+    # Fallback: treat as a single point
+    return cohort_month, cohort_month
+
+
+def format_cohort_risk_inline(cohort_risk, beta_ticker=None):
+    """Format a single cohort's risk metrics as inline print lines (no header)."""
+    lines = [
+        f"Std Dev: {cohort_risk['annualized_stddev']*100:.1f}%",
+        f"Sharpe: {cohort_risk['sharpe_ratio']:.2f}",
+        f"Sortino: {cohort_risk['sortino_ratio']:.2f}",
+    ]
+    dd_val = cohort_risk['max_drawdown'] * 100
+    peak = cohort_risk['max_drawdown_peak']
+    trough = cohort_risk['max_drawdown_trough']
+    if peak and trough:
+        lines.append(f"Max Drawdown: -{dd_val:.1f}%  ({peak.strftime('%Y-%m')} to {trough.strftime('%Y-%m')})")
+    else:
+        lines.append(f"Max Drawdown: -{dd_val:.1f}%")
+    if cohort_risk['beta'] is not None:
+        ticker = beta_ticker if beta_ticker else '^OMXSPI'
+        lines.append(f"Beta vs {ticker}: {cohort_risk['beta']:.2f}")
+    return lines
+
+
+def format_cohort_risk_json(cohort_risk):
+    """Format a single cohort's risk metrics for JSON output."""
+    return {
+        'annualized_stddev': cohort_risk['annualized_stddev'],
+        'sharpe_ratio': cohort_risk['sharpe_ratio'],
+        'sortino_ratio': cohort_risk['sortino_ratio'],
+        'max_drawdown': cohort_risk['max_drawdown'],
+        'max_drawdown_peak': cohort_risk['max_drawdown_peak'].isoformat() if cohort_risk['max_drawdown_peak'] else None,
+        'max_drawdown_trough': cohort_risk['max_drawdown_trough'].isoformat() if cohort_risk['max_drawdown_trough'] else None,
+        'beta': cohort_risk['beta'],
+        'risk_free_rate': cohort_risk['risk_free_rate'],
+    }
+
+
 def stats(args):
     """Smart statistics command with automatic updates."""
     db = get_db(args)
@@ -689,9 +738,39 @@ def stats(args):
             filtered_stats.append(row)
         stats_list = filtered_stats
         
+        # Calculate overall blended APY for the period/cohorts
+        portfolio_apy = None
+        if value_start is not None:
+            total_val = sum(row[3] for row in stats_list)
+            total_dep = sum(row[1] for row in stats_list)
+            total_with = sum(row[2] for row in stats_list)
+            start_val = sum(start_map[get_key(row[0])][3] for row in stats_list if get_key(row[0]) in start_map)
+            days = (target_end_date - value_start).days
+            portfolio_apy = calc_period_apy(start_val, total_val, total_dep, total_with, days, apy_mode)
+        else:
+            if cohorts_start is not None or cohorts_end is not None:
+                if len(stats_list) == 1:
+                    portfolio_apy = stats_list[0][10]
+                else:
+                    total_dep = sum(row[1] for row in stats_list)
+                    if total_dep > 0:
+                        portfolio_apy = sum(row[1] * (row[10] if row[10] is not None else 0.0) for row in stats_list) / total_dep
+                    else:
+                        portfolio_apy = 0.0
+            else:
+                acc_list = accounts if accounts is not None else 'all'
+                total_val = sum(row[3] for row in stats_list)
+                portfolio_apy, _ = stat_calc.calculate_account_apy(acc_list, apy_mode=apy_mode, end_date=target_end_date, current_value=total_val)
+                
+        if portfolio_apy is None:
+            portfolio_apy = 0.0
+
         # Calculate risk metrics if requested
+        risk_enabled = getattr(args, 'risk', False) or getattr(args, 'beta', None) is not None
         risk_metrics = None
-        if getattr(args, 'risk', False) or getattr(args, 'beta', None) is not None:
+        # Summary mode shows a single portfolio-level risk section; the standard
+        # cohort breakdown computes per-cohort risk inline (see the loop below).
+        if risk_enabled and getattr(args, 'summary', False):
             from risk_calculator import RiskCalculator
             calc_end_date = target_end_date if target_end_date is not None else date.today()
             calculator = RiskCalculator(
@@ -705,7 +784,7 @@ def stats(args):
                 interpolate=db.interpolate
             )
             try:
-                risk_metrics = calculator.calculate(apy_mode=apy_mode)
+                risk_metrics = calculator.calculate(portfolio_apy=portfolio_apy / 100.0)
             except Exception as e:
                 logging.error(f"Failed to calculate risk metrics: {e}")
         
@@ -718,14 +797,10 @@ def stats(args):
             total_real = sum(row[5] for row in stats_list)
             total_unreal = sum(row[6] for row in stats_list)
             
+            blended_apy = portfolio_apy
             start_val = 0.0
             if value_start is not None:
                 start_val = sum(start_map[get_key(row[0])][3] for row in stats_list if get_key(row[0]) in start_map)
-                days = (target_end_date - value_start).days
-                blended_apy = calc_period_apy(start_val, total_val, total_dep, total_with, days, apy_mode)
-            else:
-                acc_list = accounts if accounts is not None else 'all'
-                blended_apy, _ = stat_calc.calculate_account_apy(acc_list, apy_mode=apy_mode, end_date=target_end_date, current_value=total_val)
                 
             holdings = []
             if getattr(args, 'positions', False):
@@ -835,10 +910,12 @@ def stats(args):
             # Cohort-level breakdown mode
             if getattr(args, 'format', 'table') == 'json':
                 import json
+                from risk_calculator import RiskCalculator
                 def serialize_date(d):
                     if hasattr(d, 'isoformat'):
                         return d.isoformat()
                     return str(d)
+                calc_end_date = target_end_date if target_end_date is not None else date.today()
                 json_data = []
                 for row in stats_list:
                     if row[1] > 0 or row[3] > 0:
@@ -875,27 +952,30 @@ def stats(args):
                                 }
                                 for h in cohort_holdings
                             ]
+                        if risk_enabled:
+                            cs, ce = cohort_bounds(cohort_month, period)
+                            cohort_calculator = RiskCalculator(
+                                db=db,
+                                accounts=args.account,
+                                from_date=cs,
+                                to_date=calc_end_date,
+                                cohorts_start=cs,
+                                cohorts_end=ce,
+                                beta_ticker=getattr(args, 'beta', None),
+                                interpolate=db.interpolate
+                            )
+                            try:
+                                cohort_risk = cohort_calculator.calculate(
+                                    portfolio_apy=(row[10] or 0.0) / 100.0
+                                )
+                                cohort_data['risk'] = format_cohort_risk_json(cohort_risk)
+                            except Exception as e:
+                                logging.error(f"Failed to calculate risk metrics for cohort {cohort_month}: {e}")
                         json_data.append(cohort_data)
-                if risk_metrics:
-                    formatted_risk = {
-                        'annualized_return': risk_metrics['annualized_return'],
-                        'annualized_stddev': risk_metrics['annualized_stddev'],
-                        'sharpe_ratio': risk_metrics['sharpe_ratio'],
-                        'sortino_ratio': risk_metrics['sortino_ratio'],
-                        'max_drawdown': risk_metrics['max_drawdown'],
-                        'max_drawdown_peak': risk_metrics['max_drawdown_peak'].isoformat() if risk_metrics['max_drawdown_peak'] else None,
-                        'max_drawdown_trough': risk_metrics['max_drawdown_trough'].isoformat() if risk_metrics['max_drawdown_trough'] else None,
-                        'beta': risk_metrics['beta'],
-                        'risk_free_rate': risk_metrics['risk_free_rate'],
-                        'year_returns': risk_metrics['year_returns']
-                    }
-                    print(json.dumps({
-                        'cohorts': json_data,
-                        'risk': formatted_risk
-                    }, indent=2))
-                else:
-                    print(json.dumps(json_data, indent=2))
+                print(json.dumps({'cohorts': json_data}, indent=2))
             else:
+                from risk_calculator import RiskCalculator
+                calc_end_date = target_end_date if target_end_date is not None else date.today()
                 for row in stats_list:
                     if row[1] > 0 or row[3] > 0:
                         cohort_month = row[0]
@@ -927,6 +1007,29 @@ def stats(args):
                         apy_str = f"{row[10]:.1f}%" if row[10] is not None else "N/A"
                         print(f"APY: {apy_str}")
                         
+                        if risk_enabled:
+                            cs, ce = cohort_bounds(cohort_month, period)
+                            cohort_calculator = RiskCalculator(
+                                db=db,
+                                accounts=args.account,
+                                from_date=cs,
+                                to_date=calc_end_date,
+                                cohorts_start=cs,
+                                cohorts_end=ce,
+                                beta_ticker=getattr(args, 'beta', None),
+                                interpolate=db.interpolate
+                            )
+                            try:
+                                cohort_risk = cohort_calculator.calculate(
+                                    portfolio_apy=(row[10] or 0.0) / 100.0
+                                )
+                                for line in format_cohort_risk_inline(
+                                    cohort_risk, beta_ticker=getattr(args, 'beta', None)
+                                ):
+                                    print(line)
+                            except Exception as e:
+                                logging.error(f"Failed to calculate risk metrics for cohort {cohort_month}: {e}")
+                        
                         if getattr(args, 'positions', False):
                             cohort_holdings = get_stats_holdings(active_db, cohort_month=cohort_month, accounts=accounts)
                             for h in cohort_holdings:
@@ -942,8 +1045,6 @@ def stats(args):
                             else:
                                 print("  Holdings: None")
                         print()
-                if risk_metrics:
-                    print_risk_metrics_table(risk_metrics, beta_ticker=getattr(args, 'beta', None))
                         
         if warnings and not getattr(args, 'quiet', False):
             import sys

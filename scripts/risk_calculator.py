@@ -227,8 +227,34 @@ def fetch_riksbanken_rate(from_date: date, to_date: date) -> float:
     """
     Fetch the average repo rate (policy rate) from Riksbanken SWEA API.
     Fallback to 2.0% (0.02) if offline or call fails.
+
+    Raw daily observations are cached for the widest range seen so far; a
+    request whose [from_date, to_date] falls within the cached range is
+    answered by filtering cached observations (no HTTP). This makes the
+    N-cohort case (e.g. --risk over many monthly cohorts, each with a
+    different from_date but the same to_date) issue a single HTTP call for
+    the widest cohort rather than one per cohort.
     """
-    url = f"https://api.riksbank.se/swea/v1/Observations/SECBREPOEFF/{from_date.isoformat()}/{to_date.isoformat()}"
+    cache = fetch_riksbanken_rate._cache
+    cached_from = cache.get('from')
+    cached_to = cache.get('to')
+    observations = cache.get('observations', [])
+
+    if (cached_from is not None
+            and from_date >= cached_from
+            and to_date <= cached_to):
+        # Sub-range of the cached observations: filter and average locally.
+        relevant = [obs['value'] for obs in observations
+                    if from_date <= obs['date'] <= to_date]
+        if relevant:
+            return (sum(relevant) / len(relevant)) / 100.0
+        return 0.02
+
+    # Need to fetch. Widen the requested range to cover any previously cached
+    # range so subsequent sub-range requests still hit the cache.
+    fetch_from = from_date if cached_from is None else min(from_date, cached_from)
+    fetch_to = to_date if cached_to is None else max(to_date, cached_to)
+    url = f"https://api.riksbank.se/swea/v1/Observations/SECBREPOEFF/{fetch_from.isoformat()}/{fetch_to.isoformat()}"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -236,17 +262,39 @@ def fetch_riksbanken_rate(from_date: date, to_date: date) -> float:
         ),
         "Accept": "application/json"
     }
+    result = 0.02
     try:
         r = requests.get(url, headers=headers, timeout=5)
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) > 0:
-                rates = [obs["value"] for obs in data if "value" in obs]
-                if rates:
-                    return (sum(rates) / len(rates)) / 100.0
+                parsed = []
+                for obs in data:
+                    if 'value' in obs and 'date' in obs:
+                        obs_date_str = obs['date']
+                        try:
+                            obs_date = datetime_cls.strptime(obs_date_str, "%Y-%m-%d").date()
+                        except (ValueError, TypeError):
+                            continue
+                        parsed.append({'date': obs_date, 'value': float(obs['value'])})
+                if parsed:
+                    cache['from'] = fetch_from
+                    cache['to'] = fetch_to
+                    cache['observations'] = parsed
+                    relevant = [obs['value'] for obs in parsed
+                                if from_date <= obs['date'] <= to_date]
+                    if relevant:
+                        result = (sum(relevant) / len(relevant)) / 100.0
     except Exception as e:
         logging.debug(f"Failed to fetch Riksbanken policy rate: {e}")
-    return 0.02
+    return result
+
+fetch_riksbanken_rate._cache = {}
+
+
+def clear_riksbanken_cache():
+    """Clear the Riksbanken rate observation cache (used by tests)."""
+    fetch_riksbanken_rate._cache.clear()
 
 
 def fetch_yahoo_benchmark_prices(ticker: str, start_date: date, end_date: date) -> list:
@@ -317,8 +365,13 @@ class RiskCalculator:
         self.beta_ticker = beta_ticker
         self.interpolate = interpolate
 
-    def calculate(self, apy_mode='mwrr') -> dict:
-        """Perform the chronological reconstruction and calculate all metrics."""
+    def calculate(self, portfolio_apy: float) -> dict:
+        """Perform the chronological reconstruction and calculate all metrics.
+
+        portfolio_apy is the annualized return (as a fraction, e.g. 0.07 for 7%)
+        for the period/scope under evaluation. It is computed once by the caller
+        (cli.stats) so the risk metrics and the displayed APY stay consistent.
+        """
         from cli import resolve_accounts
         cur = self.db.get_cursor()
         
@@ -446,58 +499,59 @@ class RiskCalculator:
             cash_flows.append(period_cf)
 
         # 5. Compute monthly returns
+        # A period's simple-Dietz return is only meaningful when (a) the
+        # starting value is material relative to the period's cash flow, and
+        # (b) the resulting return is within a plausible range. When a large
+        # deposit/withdrawal hits a small starting balance (common for the
+        # first period of a freshly-funded cohort), or when an asset is
+        # purchased but unpriced at the period boundary (so it contributes 0
+        # to v at the start and a non-zero value next period once a price
+        # appears), (v_end - v_start - cf) / v_start explodes and pollutes
+        # stddev, Sharpe, and the cumulative drawdown index. Such periods are
+        # flagged unreliable and excluded from the return-based risk metrics.
+        MATERIALITY = 0.5
+        MAX_PLAUSIBLE_RETURN = 1.0
         returns = []
+        reliable = []
         for i in range(1, len(sampling_dates)):
             v_start = portfolio_values[i-1]
             v_end = portfolio_values[i]
             cf = cash_flows[i-1]
-            
+
             if v_start > 0.01:
                 r = (v_end - v_start - cf) / v_start
+                is_reliable = (
+                    v_start >= MATERIALITY * abs(cf)
+                    and abs(r) <= MAX_PLAUSIBLE_RETURN
+                )
             else:
+                # Leading placeholder period (no invested capital yet); the
+                # zero return is harmless and keeps period_start anchored.
                 r = 0.0
+                is_reliable = True
             returns.append(r)
+            reliable.append(is_reliable)
+
+        # Returns used for variance / Sharpe / Sortino / drawdown index.
+        reliable_returns = [r for r, ok in zip(returns, reliable) if ok]
+        reliable_idx = [i for i, ok in enumerate(reliable) if ok]
 
         # 6. Fetch Risk-Free Rate
         rf_rate = fetch_riksbanken_rate(from_date, to_date)
         
-        # 7. Calculate overall return (APY) of the specific period
-        total_days = (to_date - from_date).days
-        if total_days <= 0:
-            overall_return = 0.0
-        elif apy_mode == 'twrr':
-            # TWRR is the compounded product of sub-period returns
-            prod = 1.0
-            for r in returns:
-                prod *= (1.0 + r)
-            years = total_days / 365.25
-            overall_return = (prod ** (1.0 / years) - 1.0) if prod >= 0 else 0.0
-        else:
-            # MWRR (Modified Dietz) for the specific period
-            sum_w_cf = 0.0
-            for cf_date, cf_amount in cash_flows_by_date.items():
-                if from_date <= cf_date <= to_date:
-                    days_elapsed = (cf_date - from_date).days
-                    weight = (total_days - days_elapsed) / total_days
-                    sum_w_cf += weight * cf_amount
-                    
-            hpr_denominator = portfolio_values[0] + sum_w_cf
-            if hpr_denominator > 0.01:
-                hpr = (portfolio_values[-1] - portfolio_values[0] - sum(cash_flows)) / hpr_denominator
-                years = total_days / 365.25
-                overall_return = ((1.0 + hpr) ** (1.0 / years) - 1.0) if (1.0 + hpr) >= 0 else -1.0 + (1.0 + hpr)
-            else:
-                overall_return = 0.0
+        # 7. Overall return (APY) is provided by the caller to ensure the risk
+        # metrics use the same APY figure that is displayed in the stats table.
+        overall_return = portfolio_apy
 
-        # 8. Calculate risk metrics
-        n = len(returns)
+        # 8. Calculate risk metrics (from reliable returns only)
+        n = len(reliable_returns)
         if n < 2:
             annualized_stddev = 0.0
             sharpe = 0.0
             sortino = 0.0
         else:
-            mean_r = sum(returns) / n
-            variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+            mean_r = sum(reliable_returns) / n
+            variance = sum((r - mean_r) ** 2 for r in reliable_returns) / (n - 1)
             stddev = math.sqrt(variance)
             annualized_stddev = stddev * math.sqrt(12)
             
@@ -507,7 +561,7 @@ class RiskCalculator:
                 sharpe = 0.0
                 
             rf_monthly = rf_rate / 12.0
-            downside_diffs = [min(r - rf_monthly, 0.0) for r in returns]
+            downside_diffs = [min(r - rf_monthly, 0.0) for r in reliable_returns]
             downside_variance = sum(diff ** 2 for diff in downside_diffs) / (n - 1)
             downside_stddev = math.sqrt(downside_variance)
             annualized_downside_stddev = downside_stddev * math.sqrt(12)
@@ -517,7 +571,12 @@ class RiskCalculator:
             else:
                 sortino = 0.0
 
-        # 9. Maximum Drawdown (calculated on cumulative return index to isolate from cash flows)
+        # 9. Maximum Drawdown (cumulative return index built from reliable
+        # returns only; the index holds — does not update — during unreliable
+        # periods, so a cf-dominated period cannot inject a spurious -100%+ move.
+        # The index is floored at a tiny positive value so drawdown is always
+        # strictly less than 100%, even if a genuine near-total-loss return
+        # occurs in a reliable period.)
         max_dd = 0.0
         peak = 1.0
         peak_date = sampling_dates[0]
@@ -525,16 +584,20 @@ class RiskCalculator:
         current_peak_date = sampling_dates[0]
         
         index_value = 1.0
-        index_values = [1.0]
-        for r in returns:
+        index_points = [(sampling_dates[0], 1.0)]
+        for i, r in enumerate(returns):
+            if not reliable[i]:
+                continue
             index_value *= (1.0 + r)
-            index_values.append(index_value)
-            
-        for val, dt in zip(index_values, sampling_dates):
+            if index_value < 1e-9:
+                index_value = 1e-9
+            index_points.append((sampling_dates[i+1], index_value))
+        
+        for dt, val in index_points:
             if val > peak:
                 peak = val
                 current_peak_date = dt
-            if peak > 0.0001:
+            if peak > 1e-9:
                 dd = (peak - val) / peak
                 if dd > max_dd:
                     max_dd = dd
@@ -557,12 +620,15 @@ class RiskCalculator:
                         r_bench = 0.0
                     bench_returns.append(r_bench)
                     
-                if len(bench_returns) >= 2:
-                    mean_bench = sum(bench_returns) / len(bench_returns)
-                    mean_port = sum(returns) / len(returns)
+                # Align beta computation to reliable periods only
+                port_r = [returns[i] for i in reliable_idx]
+                bench_r = [bench_returns[i] for i in reliable_idx]
+                if len(port_r) >= 2:
+                    mean_bench = sum(bench_r) / len(bench_r)
+                    mean_port = sum(port_r) / len(port_r)
                     
-                    covariance = sum((r_p - mean_port) * (r_b - mean_bench) for r_p, r_b in zip(returns, bench_returns)) / (len(returns) - 1)
-                    variance_bench = sum((r_b - mean_bench) ** 2 for r_b in bench_returns) / (len(bench_returns) - 1)
+                    covariance = sum((r_p - mean_port) * (r_b - mean_bench) for r_p, r_b in zip(port_r, bench_r)) / (len(port_r) - 1)
+                    variance_bench = sum((r_b - mean_bench) ** 2 for r_b in bench_r) / (len(bench_r) - 1)
                     
                     if variance_bench > 1e-8:
                         beta = covariance / variance_bench
