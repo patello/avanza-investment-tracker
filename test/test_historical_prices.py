@@ -172,9 +172,12 @@ def test_cohort_value_resolution(tmp_path):
     val_feb = parser.cohort_value(date(2023, 1, 1), '1111', as_of_date=date(2023, 2, 28))
     assert val_feb == 1500.0  # 10 shares * 150.0
     
-    # 4. As of 2023-01-01 (before any price in history), falls back to latest_price (200.0)
+    # 4. As of 2023-01-01 (before any price in history), flat-carry the first
+    #    known price (100.0 from 2023-01-15) backwards. Do NOT fall back to
+    #    latest_price — that is a current value and would leak a future price
+    #    into a historical valuation.
     val_before = parser.cohort_value(date(2023, 1, 1), '1111', as_of_date=date(2023, 1, 1))
-    assert val_before == 2000.0
+    assert val_before == 1000.0  # 10 shares * 100.0 (first known price)
 
 
 @patch('requests.post')

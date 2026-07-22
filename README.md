@@ -374,6 +374,8 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 - `--format {table,json}`: Output formatting (default: `table`)
 - `--quiet`, `-q`: Suppress price data staleness warnings
 - `--no-interpolation`: Disable linear interpolation for sparse historical price data (falls back to nearest prior price, which may trigger staleness warnings)
+- `--risk`: Calculate and display portfolio-level risk metrics (Annualized Standard Deviation, Sharpe Ratio, Sortino Ratio, Maximum Drawdown with peak/trough calendar months)
+- `--beta [TICKER]`: Include the portfolio Beta calculation vs the specified benchmark (e.g. `^OMXSPI`, `ACWI`). Defaults to `^OMXSPI` if the flag is passed without a ticker value. Specifying `--beta` automatically enables risk metrics.
 
 ### Guidelines: When to use what date boundaries
 1. **To see how cohorts from a certain period look today:**

@@ -642,15 +642,9 @@ class DatabaseHandler:
 
         # Case 2: Before first known price point
         if idx == 0:
-            # Try latest_price from assets first, otherwise flat from first known price
-            cursor = self.get_cursor()
-            cursor.execute("SELECT latest_price, latest_price_date FROM assets WHERE asset_id = ?", (asset_id,))
-            row = cursor.fetchone()
-            if row and row[0] is not None and row[0] > 0:
-                latest_price, latest_date = row[0], row[1]
-                if isinstance(latest_date, str):
-                    latest_date = date.fromisoformat(latest_date)
-                return latest_price, False, None, latest_date
+            # Flat-carry the first known price forward. Do NOT use
+            # assets.latest_price here — it is a current value that would
+            # leak a future price into historical valuations.
             return prices[0][1], False, None, prices[0][0]
 
         # Case 3: After last known price point
