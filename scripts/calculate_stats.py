@@ -88,7 +88,82 @@ class StatCalculator:
         if (1 + hpr) >= 0 and years_elapsed > 0:
             return 100 * ((1 + hpr) ** (1 / years_elapsed) - 1)
         return None
-    
+
+    @staticmethod
+    def _deposit_weighted_year_start(year_str, accounts, cur, fallback):
+        """
+        Compute the deposit-weighted average date of cash deposits in a year,
+        for use as the TWRR start date for yearly APY.
+
+        Replaces the fixed July 1 heuristic. The weighted average is the
+        "center of mass" of the year's deposits — the same intuition July 1
+        approximated for a full year of even flows, but derived from real
+        deposit timing so partial years no longer explode. Falls back to
+        `fallback` when no deposits are recorded in the year.
+        """
+        placeholders = ",".join("?" * len(accounts))
+        cur.execute(f"""
+            SELECT date, total
+            FROM transactions
+            WHERE strftime('%Y', date) = ?
+              AND account IN ({placeholders})
+              AND transaction_type IN ('Insättning', 'Autogiroinsättning')
+              AND total > 0
+        """, (year_str,) + tuple(accounts))
+        rows = cur.fetchall()
+
+        total_weight = 0.0
+        weighted_ordinal = 0.0
+        for tx_date, total in rows:
+            if not total or total <= 0:
+                continue
+            d = datetime.strptime(tx_date, "%Y-%m-%d").date() if isinstance(tx_date, str) else tx_date
+            total_weight += total
+            weighted_ordinal += total * d.toordinal()
+
+        if total_weight > 0:
+            return date.fromordinal(int(round(weighted_ordinal / total_weight)))
+        return fallback
+
+    @staticmethod
+    def _deposit_weighted_cohort_start(cohort_month, accounts, cur, fallback):
+        """
+        Compute the deposit-weighted average date of deposits allocated to a
+        specific cohort month, for use as the start date for monthly APY.
+
+        Replaces the fixed 15th-of-month heuristic with the real deposit
+        center-of-mass. Matches the bucketing in DataParser.allocate_to_month
+        (cutoff_days=10): a transaction lands in cohort month M if it is on
+        day > 10 of M, or day <= 10 of M+1. Falls back to `fallback` when no
+        deposits are recorded for the cohort.
+        """
+        range_start = cohort_month.replace(day=11)
+        range_end = (cohort_month.replace(day=1) + timedelta(days=32)).replace(day=10)
+
+        placeholders = ",".join("?" * len(accounts))
+        cur.execute(f"""
+            SELECT date, total
+            FROM transactions
+            WHERE date BETWEEN ? AND ?
+              AND account IN ({placeholders})
+              AND transaction_type IN ('Insättning', 'Autogiroinsättning')
+              AND total > 0
+        """, (range_start.isoformat(), range_end.isoformat()) + tuple(accounts))
+        rows = cur.fetchall()
+
+        total_weight = 0.0
+        weighted_ordinal = 0.0
+        for tx_date, total in rows:
+            if not total or total <= 0:
+                continue
+            d = datetime.strptime(tx_date, "%Y-%m-%d").date() if isinstance(tx_date, str) else tx_date
+            total_weight += total
+            weighted_ordinal += total * d.toordinal()
+
+        if total_weight > 0:
+            return date.fromordinal(int(round(weighted_ordinal / total_weight)))
+        return fallback
+
     def _ensure_per_account_tables(self):
         """Create per-account statistics tables if they don't exist."""
         self.db.connect()
@@ -447,7 +522,8 @@ class StatCalculator:
                     month_date = month_str
 
                 active_base = active_base or 0.0
-                start_date = month_date.replace(day=15)
+                start_date = self._deposit_weighted_cohort_start(
+                    month_date, [account], cur, month_date.replace(day=15))
                 annual_per_yield = self._calc_apy(
                     apy_mode, active_base, value, deposit, total_gainloss,
                     month_str, account, start_date, today, cur, closed_return=closed_return)
@@ -597,8 +673,12 @@ class StatCalculator:
                 if last_month:
                     year_date = f"{year_str}-01-01"
                     
-                    # Calculate APY using year-level cohort cash flows
-                    start_date = datetime(year=int(year_str), month=7, day=1).date()
+                    # Calculate APY using year-level cohort cash flows.
+                    # Start date is the deposit-weighted average cash-flow date
+                    # of the year (falls back to July 1 when no flows exist).
+                    july_first = datetime(year=int(year_str), month=7, day=1).date()
+                    start_date = self._deposit_weighted_year_start(
+                        year_str, [account], cur, july_first)
                     
                     if apy_mode == 'twrr':
                         if active_base > 1e-4 and value > 0:
@@ -788,7 +868,8 @@ class StatCalculator:
                 else:
                     month_date = month
 
-                cohort_start_date = month_date.replace(day=15)
+                cohort_start_date = self._deposit_weighted_cohort_start(
+                    month_date, accounts, cur, month_date.replace(day=15))
                 annual_per_yield = self._calc_apy_multi(
                     apy_mode, accounts, value, deposit, total_gainloss,
                     month, cohort_start_date, today, cur)
@@ -854,7 +935,8 @@ class StatCalculator:
                     realized_gainloss_per = 0.0
                     unrealized_gainloss_per = 0.0
                 
-                cohort_start_date = datetime(year=year, month=7, day=1).date()
+                cohort_start_date = self._deposit_weighted_year_start(
+                    str(year), accounts, cur, datetime(year=year, month=7, day=1).date())
                 annual_per_yield = self._calc_apy_year_multi(
                     apy_mode, accounts, value, deposit, total_gainloss,
                     str(year), cohort_start_date, today, cur)
