@@ -451,9 +451,6 @@ class RiskCalculator:
                         flows.append((d, cf))
             period_cash_flows.append(flows)
 
-        # Per-period cash-flow totals (used by year_returns in section 11).
-        cash_flows = [sum(amt for _, amt in flows) for flows in period_cash_flows]
-
         # 5. Compute monthly returns using Modified Dietz.
         #    r = (v_end - v_start - cf_total) / (v_start + Σ(w_i · cf_i))
         #    where w_i = (t_end - d_i) / (t_end - t_start) time-weights each
@@ -507,13 +504,20 @@ class RiskCalculator:
         # metrics use the same APY figure that is displayed in the stats table.
         overall_return = portfolio_apy
 
-        # 8. Calculate risk metrics
+        # 8. Calculate risk metrics.
+        # The numerator uses the caller-supplied annualized return (APY) so the
+        # ratios stay consistent with the APY shown in the stats table; the
+        # denominator is the annualized volatility of the monthly Modified
+        # Dietz returns computed above. The two come from different return
+        # series by design (display consistency over theoretical purity).
         n = len(returns)
         if n < 2:
             annualized_stddev = 0.0
             sharpe = 0.0
             sortino = 0.0
         else:
+            # Variance is shift-invariant, so using raw returns here is
+            # numerically equivalent to using (r - rf_monthly) excess returns.
             mean_r = sum(returns) / n
             variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
             stddev = math.sqrt(variance)
@@ -524,6 +528,8 @@ class RiskCalculator:
             else:
                 sharpe = 0.0
 
+            # Sortino measures downside deviation relative to the monthly
+            # risk-free rate as the minimum acceptable return (MAR).
             rf_monthly = rf_rate / 12.0
             downside_diffs = [min(r - rf_monthly, 0.0) for r in returns]
             downside_variance = sum(diff ** 2 for diff in downside_diffs) / (n - 1)
@@ -589,34 +595,17 @@ class RiskCalculator:
                     if variance_bench > 1e-8:
                         beta = covariance / variance_bench
 
-        # 11. Returns by Calendar Year
+        # 11. Returns by Calendar Year. Compound the monthly Modified Dietz
+        #     returns whose period ends in each year. This links the same
+        #     per-period series used for volatility and drawdown, so yearly
+        #     figures stay consistent with the rest of the metrics and robust
+        #     to large intra-year cash flows (a full-year simple Dietz would
+        #     mis-weight mid-year flows).
         year_returns = {}
-        unique_years = sorted(list(set(d.year for d in sampling_dates[1:])))
-        for y in unique_years:
-            y_indices = [i for i, d in enumerate(sampling_dates) if d.year == y]
-            if y_indices:
-                first_idx = y_indices[0]
-                last_idx = y_indices[-1]
-                
-                if first_idx == 0:
-                    t_start_idx = 0
-                    t_end_idx = last_idx
-                    y_cf = sum(cash_flows[j] for j in range(0, last_idx))
-                else:
-                    t_start_idx = first_idx - 1
-                    t_end_idx = last_idx
-                    y_cf = sum(cash_flows[j] for j in range(t_start_idx, t_end_idx))
-                
-                v_start = portfolio_values[t_start_idx]
-                v_end = portfolio_values[t_end_idx]
-                
-                if v_start > 0.01:
-                    r_year = (v_end - v_start - y_cf) / v_start
-                elif y_cf > 0.01:
-                    r_year = (v_end - v_start - y_cf) / y_cf
-                else:
-                    r_year = 0.0
-                year_returns[y] = r_year
+        for i, r in enumerate(returns):
+            y = sampling_dates[i + 1].year
+            year_returns[y] = year_returns.get(y, 1.0) * (1.0 + r)
+        year_returns = {y: v - 1.0 for y, v in year_returns.items()}
 
         return {
             'period_start': sampling_dates[0],
