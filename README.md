@@ -356,6 +356,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
 | `python scripts/cli.py virtual SUBCOMMAND` | Manage virtual portfolios — sub-portfolios within a physical account (see below) |
+| `python scripts/cli.py report [OPTIONS]` | Investment report with a virtual-portfolio section and a virtual-vs-parent-vs-benchmark comparison |
 
 ### Global Options
 - `--database PATH` (default: `data/asset_data.db`)
@@ -458,6 +459,32 @@ FROM v_virtual_portfolio_rollup;
 SELECT COALESCE(parent_account, account) AS family, asset_name, SUM(held_amount)
 FROM v_account_asset_holdings GROUP BY family, asset_name;
 ```
+
+### Reporting
+
+```bash
+# Full report: overview + accounts hierarchy + virtual section + comparison
+python cli.py report --update-prices auto
+
+# Add a benchmark to the performance comparison (annualized over portfolio lifetime)
+python cli.py report --benchmark ^OMXSPI
+
+# Machine-readable
+python cli.py report --format json
+```
+
+The `report` command shows the total portfolio value (physical own + virtual),
+per-account and per-virtual APY, each virtual's share of its parent's combined
+value, and a comparison table of physical / virtual / benchmark returns. It
+reuses the stats engine for APY and Yahoo Finance (when `--benchmark` is given)
+for the benchmark period return.
+
+### Grafana dashboard
+
+An importable Grafana dashboard that visualizes physical accounts with their
+virtual sub-portfolios lives in `grafana/`. It queries the SQLite database via
+the `frser-sqlite-datasource` plugin using the views above. See
+`grafana/README.md` for setup and the panel/query reference.
 
 ### Limitations
 

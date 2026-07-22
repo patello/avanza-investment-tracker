@@ -2153,6 +2153,242 @@ def print_account_tree(stat_calc, db):
     print(f"{'TOTAL':<30} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f}")
 
 
+def report(args):
+    """Generate an investment report with a virtual-portfolio section and a
+    virtual-vs-parent-vs-benchmark performance comparison.
+
+    Reuses calculate_account_apy for per-account returns, the
+    v_virtual_portfolio_rollup view for combined totals, and (optionally)
+    Yahoo Finance for the benchmark period return.
+    """
+    db = get_db(args)
+    db.interpolate = not getattr(args, 'no_interpolation', False)
+    apy_mode = getattr(args, 'apy_mode', 'mwrr')
+    benchmark = getattr(args, 'benchmark', None)
+    fmt = getattr(args, 'format', 'table')
+
+    update_all = getattr(args, 'update_all', False)
+    if getattr(args, 'update_prices', 'auto') == 'always':
+        try:
+            StatCalculator(db).update_prices(force=True, update_all=update_all)
+            db.set_metadata('last_price_update', datetime.now().isoformat())
+            db.set_metadata('last_stats_calculation', '')
+        except Exception as e:
+            logging.error(f"Failed to update prices: {e}")
+            return 1
+    elif getattr(args, 'update_prices', 'auto') == 'auto':
+        fresh, _ = prices_are_fresh(db, update_all=update_all)
+        if not fresh or any_assets_need_prices(db, update_all=update_all):
+            try:
+                StatCalculator(db).update_prices(force=True, update_all=update_all)
+                db.set_metadata('last_price_update', datetime.now().isoformat())
+                db.set_metadata('last_stats_calculation', '')
+            except Exception as e:
+                logging.warning(f"Price update skipped: {e}")
+
+    db.connect()
+    cur = db.get_cursor()
+    stat_calc = StatCalculator(db)
+    summaries = {s[0]: s for s in stat_calc.get_account_summaries(None)}
+    virtual_map = db.get_virtual_map()
+    nicknames = db.get_all_account_nicknames()
+
+    apy = {}
+    for acc in summaries:
+        try:
+            a, _ = stat_calc.calculate_account_apy(acc, apy_mode=apy_mode, current_value=summaries[acc][3])
+        except Exception:
+            a = None
+        apy[acc] = a
+
+    cur.execute(
+        "SELECT parent_account, parent_display_name, own_total, virtual_total, combined_total, virtual_count "
+        "FROM v_virtual_portfolio_rollup"
+    )
+    rollup = {}
+    for r in cur.fetchall():
+        rollup[r[0]] = dict(zip(
+            ['parent_account', 'parent_display_name', 'own_total', 'virtual_total', 'combined_total', 'virtual_count'], r))
+
+    physical = sorted((a for a in summaries if a not in virtual_map),
+                      key=lambda a: summaries[a][3], reverse=True)
+    total_value = sum(s[3] for s in summaries.values())
+    phys_own = sum(summaries[a][3] for a in physical)
+    virt_total = sum(summaries[a][3] for a in virtual_map if a in summaries)
+
+    dep = withd = 0.0
+    if physical:
+        ph = ",".join("?" for _ in physical)
+        cur.execute(
+            f"SELECT COALESCE(SUM(deposit),0), COALESCE(SUM(withdrawal),0) FROM cohort_data WHERE account IN ({ph})",
+            physical)
+        dep, withd = cur.fetchone()
+    net_invested = (dep or 0) - (withd or 0)
+    total_gain = total_value - net_invested
+    try:
+        blended, _ = stat_calc.calculate_account_apy('all', apy_mode=apy_mode, current_value=total_value)
+    except Exception:
+        blended = None
+
+    # Optional benchmark period return (annualized) over the portfolio's lifetime
+    benchmark_apy = None
+    if benchmark:
+        min_date_str, _ = db.get_date_range()
+        if min_date_str:
+            try:
+                from risk_calculator import fetch_yahoo_benchmark_prices, get_benchmark_price
+                start = datetime.strptime(str(min_date_str)[:10], "%Y-%m-%d").date()
+                end = date.today()
+                prices = fetch_yahoo_benchmark_prices(benchmark, start, end)
+                if prices:
+                    sp = get_benchmark_price(prices, start)
+                    ep = get_benchmark_price(prices, end)
+                    days = (end - start).days
+                    if sp and sp > 0 and ep > 0 and days > 0:
+                        benchmark_apy = 100 * ((ep / sp) ** (365.0 / days) - 1)
+            except Exception as e:
+                logging.warning(f"Could not compute benchmark return: {e}")
+
+    children_of = {}
+    for v, p in virtual_map.items():
+        children_of.setdefault(p, []).append(v)
+
+    def fmt_apy(v):
+        return f"{v:.1f}%" if v is not None else "N/A"
+
+    if fmt == 'json':
+        import json
+        def acc_node(a):
+            s = summaries.get(a)
+            return {
+                'account': a,
+                'display_name': nicknames.get(a, a),
+                'is_virtual': a in virtual_map,
+                'parent_account': virtual_map.get(a),
+                'cash': s[1] if s else 0.0,
+                'assets': s[2] if s else 0.0,
+                'total': s[3] if s else 0.0,
+                'apy': apy.get(a),
+            }
+        accounts_tree = []
+        for pa in physical:
+            node = acc_node(pa)
+            node['children'] = [acc_node(v) for v in sorted(children_of.get(pa, []), key=lambda x: summaries.get(x, (0, 0, 0, 0))[3], reverse=True) if v in summaries]
+            accounts_tree.append(node)
+        virtual_section = []
+        for v in sorted(virtual_map):
+            if v not in summaries:
+                continue
+            p = virtual_map[v]
+            comb = rollup.get(p, {}).get('combined_total') or 0.0
+            vt = summaries[v][3]
+            virtual_section.append({
+                'virtual': v, 'parent_account': p, 'value': vt, 'apy': apy.get(v),
+                'pct_of_combined': (vt / comb * 100) if comb > 0 else 0.0,
+            })
+        result = {
+            'as_of': date.today().isoformat(),
+            'overview': {
+                'physical_count': len(physical),
+                'virtual_count': len(virtual_map),
+                'total_value': total_value,
+                'physical_own': phys_own,
+                'virtual_total': virt_total,
+                'total_deposited': dep or 0,
+                'total_withdrawn': withd or 0,
+                'total_gain': total_gain,
+                'total_gain_pct': (total_gain / net_invested * 100) if net_invested > 0 else 0.0,
+                'blended_apy': blended,
+                'apy_mode': apy_mode,
+            },
+            'accounts': accounts_tree,
+            'virtual_portfolios': virtual_section,
+            'comparison': {
+                'benchmark': benchmark,
+                'benchmark_apy': benchmark_apy,
+                'rows': [
+                    {
+                        'account': a, 'display_name': nicknames.get(a, a),
+                        'type': 'virtual' if a in virtual_map else 'physical',
+                        'apy': apy.get(a),
+                        'vs_parent': (apy[a] - apy[virtual_map[a]])
+                                     if (a in virtual_map and apy.get(a) is not None and apy.get(virtual_map[a]) is not None)
+                                     else None,
+                        'vs_benchmark': (apy[a] - benchmark_apy)
+                                        if (benchmark_apy is not None and apy.get(a) is not None) else None,
+                    }
+                    for a in list(physical) + sorted(virtual_map) if a in summaries
+                ],
+            },
+        }
+        print(json.dumps(result, indent=2))
+        return 0
+
+    # ---- text report ----
+    print(f"=== Investment Report (as of {date.today().isoformat()}) ===\n")
+    print("Portfolio overview")
+    print(f"  Physical accounts:   {len(physical)}")
+    print(f"  Virtual portfolios:  {len(virtual_map)}")
+    print(f"  Total value:         {total_value:,.0f} SEK")
+    print(f"    (physical own:     {phys_own:,.0f}  +  virtual:  {virt_total:,.0f})")
+    print(f"  Total deposited:     {dep or 0:,.0f} SEK")
+    gl_sign = "+" if total_gain >= 0 else ""
+    gl_pct = (total_gain / net_invested * 100) if net_invested > 0 else 0.0
+    print(f"  Total gain:          {gl_sign}{total_gain:,.0f} SEK ({gl_sign}{gl_pct:.1f}%)")
+    print(f"  Blended APY (all):   {fmt_apy(blended)} ({apy_mode.upper()})")
+
+    print("\nAccounts")
+    print(f"  {'Account':<24} {'Cash':>10} {'Assets':>10} {'Total':>10} {'APY':>8}")
+    print("  " + "-" * 66)
+    for pa in physical:
+        s = summaries[pa]
+        print(f"  {nicknames.get(pa, pa):<24} {s[1]:>10,.0f} {s[2]:>10,.0f} {s[3]:>10,.0f} {fmt_apy(apy.get(pa)):>8}")
+        for v in sorted(children_of.get(pa, []), key=lambda x: summaries.get(x, (0, 0, 0, 0))[3], reverse=True):
+            if v not in summaries:
+                continue
+            vs = summaries[v]
+            label = (nicknames.get(v, v) + " [V]")[:24]
+            print(f"    -- {label:<22} {vs[1]:>10,.0f} {vs[2]:>10,.0f} {vs[3]:>10,.0f} {fmt_apy(apy.get(v)):>8}")
+
+    if virtual_map:
+        print("\nVirtual portfolios")
+        print(f"  {'Virtual':<16} {'Parent':<10} {'Value':>10} {'APY':>8} {'% of combined':>14}")
+        print("  " + "-" * 62)
+        for v in sorted(virtual_map):
+            if v not in summaries:
+                continue
+            p = virtual_map[v]
+            comb = rollup.get(p, {}).get('combined_total') or 0.0
+            vt = summaries[v][3]
+            pct = (vt / comb * 100) if comb > 0 else 0.0
+            print(f"  {nicknames.get(v, v):<16} {p:<10} {vt:>10,.0f} {fmt_apy(apy.get(v)):>8} {pct:>13.1f}%")
+
+    print("\nPerformance comparison" + (f" vs {benchmark}" if benchmark else ""))
+    header = f"  {'Account':<24} {'Type':<10} {'APY':>8} {'vs parent':>11}"
+    if benchmark:
+        header += f" {'vs benchmark':>14}"
+    print(header)
+    print("  " + "-" * (66 + (14 if benchmark else 0)))
+    for a in physical:
+        line = f"  {nicknames.get(a, a):<24} {'physical':<10} {fmt_apy(apy.get(a)):>8} {'--':>11}"
+        if benchmark and benchmark_apy is not None and apy.get(a) is not None:
+            line += f" {apy[a] - benchmark_apy:>+13.1f} pp"
+        print(line)
+    for v in sorted(virtual_map):
+        if v not in summaries:
+            continue
+        p = virtual_map[v]
+        vs_parent = (apy[v] - apy[p]) if (apy.get(v) is not None and apy.get(p) is not None) else None
+        vstr = f"{vs_parent:>+10.1f} pp" if vs_parent is not None else f"{'--':>11}"
+        line = f"  {nicknames.get(v, v):<24} {'virtual':<10} {fmt_apy(apy.get(v)):>8} {vstr}"
+        if benchmark and benchmark_apy is not None and apy.get(v) is not None:
+            line += f" {apy[v] - benchmark_apy:>+13.1f} pp"
+        print(line)
+    if benchmark:
+        print(f"  {benchmark:<24} {'benchmark':<10} {fmt_apy(benchmark_apy):>8}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Avanza investment tracker CLI",
@@ -2486,6 +2722,25 @@ Examples:
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
     status_parser.set_defaults(func=status)
+
+    # Report command (issue #74 phase 3): virtual section + benchmark comparison
+    report_parser = subparsers.add_parser(
+        'report', help='Investment report with a virtual-portfolio section and benchmark comparison')
+    report_parser.add_argument(
+        '--benchmark', nargs='?', const='^OMXSPI', default=None,
+        help='Benchmark ticker for the performance comparison (default: ^OMXSPI if flag is passed)')
+    report_parser.add_argument(
+        '--apy-mode', choices=['mwrr', 'twrr'], default='mwrr', help='APY calculation method (default: mwrr)')
+    report_parser.add_argument(
+        '--update-prices', choices=['auto', 'always', 'never'], default='auto',
+        help='When to update prices (default: auto)')
+    report_parser.add_argument(
+        '--update-all', action='store_true', help='Update prices for all assets, held or not')
+    report_parser.add_argument(
+        '--format', choices=['table', 'json'], default='table', help='Output format (default: table)')
+    report_parser.add_argument(
+        '--no-interpolation', action='store_true', help='Disable linear price interpolation')
+    report_parser.set_defaults(func=report)
 
     # Reset command
     reset_parser = subparsers.add_parser('reset', help='Reset database state')

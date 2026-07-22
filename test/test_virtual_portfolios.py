@@ -749,3 +749,46 @@ def test_view_rollup_excludes_virtual_accounts(tmp_path):
     parents = {r["parent_account"] for r in rows}
     assert "1111" in parents
     assert "YOLO" not in parents
+
+
+# ---------- report command (phase 3) ----------
+
+_REPORT_NS = dict(benchmark=None, apy_mode='mwrr', update_prices='never',
+                  update_all=False, format='table', no_interpolation=False)
+
+
+def test_report_renders_with_virtuals(tmp_path, capsys):
+    db_file = _view_setup(tmp_path)
+    rc = cli.report(_ns(db_file, **_REPORT_NS))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Investment Report" in out
+    assert "Virtual portfolios" in out
+    assert "YOLO" in out
+    assert "Performance comparison" in out
+    assert "1111" in out
+
+
+def test_report_no_virtuals(tmp_path, capsys):
+    db_file = _base_parent_db(tmp_path)
+    rc = cli.report(_ns(db_file, **_REPORT_NS))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Virtual portfolios:  0" in out
+    assert "Investment Report" in out
+
+
+def test_report_json_shape(tmp_path, capsys):
+    db_file = _view_setup(tmp_path)
+    rc = cli.report(_ns(db_file, **{**_REPORT_NS, 'format': 'json'}))
+    assert rc == 0
+    import json
+    data = json.loads(capsys.readouterr().out)
+    for key in ('overview', 'accounts', 'virtual_portfolios', 'comparison'):
+        assert key in data
+    assert data['overview']['virtual_count'] == 1
+    assert len(data['virtual_portfolios']) == 1
+    assert data['virtual_portfolios'][0]['virtual'] == 'YOLO'
+    assert data['virtual_portfolios'][0]['parent_account'] == '1111'
+    # accounts tree nests virtuals under their physical parent
+    assert data['accounts'][0]['children'][0]['account'] == 'YOLO'
