@@ -112,12 +112,17 @@ def import_data(args):
         rows_added = data_parser.add_data(args.file)
         logging.info(f"Added {rows_added} rows to the database")
 
-        # Auto-route sells to the accounts that actually hold the shares, so a
-        # sell reported on the physical account does not abort reprocessing when
-        # the shares were allocated to a virtual portfolio. No-op without virtuals.
-        routed = route_imported_sells_to_holders(db)
-        if routed:
-            logging.info(f"Auto-routed {routed} sell(s) to virtual accounts holding the shares.")
+        # Auto-route sells and distribute dividends to the accounts that
+        # actually hold the shares, so a transaction reported on the physical
+        # account does not abort reprocessing (sells) or get mis-attributed
+        # (dividends) when the shares were allocated to a virtual portfolio.
+        # No-op without virtuals.
+        routed_sells = route_imported_sells_to_holders(db)
+        routed_divs = route_imported_dividends_to_holders(db)
+        if routed_sells or routed_divs:
+            logging.info(
+                f"Auto-routed {routed_sells} sell(s) and {routed_divs} dividend(s) to virtual accounts holding the shares."
+            )
 
         # Reset cohort tables (preserving asset_prices) so every import is a
         # clean rebuild — prevents stale cohort_assets entries from surviving
@@ -1607,6 +1612,86 @@ def route_imported_sells_to_holders(db):
                 f"Auto-split sell of {sell_shares} '{asset}': {a_held} on '{account}', "
                 f"{shortfall} routed to '{largest_acc}'."
             )
+        routed += 1
+
+    if routed:
+        db.commit()
+    return routed
+
+
+def route_imported_dividends_to_holders(db):
+    """Distribute dividends across the accounts that actually hold the asset, so
+    each account is credited for the shares it holds. Without this, a dividend
+    on the physical account credits only that account's holdings (and dumps any
+    leftover there), understating virtual portfolios that hold the shares.
+
+    Rule per dividend (proportional, since a dividend is paid per share held):
+      * if only the dividend's own account holds the asset -> leave
+      * otherwise split the dividend across every related holder so each gets a
+        row sized to its actual holdings (own account keeps/reuses the original
+        row; every other holder gets a new row).
+    No-op without virtuals. Returns the number of dividends redistributed.
+    """
+    db.connect()
+    virtual_map = db.get_virtual_map()
+    if not virtual_map:
+        return 0
+    cur = db.get_cursor()
+
+    cur.execute(
+        "SELECT rowid, date, account, asset_name, amount, price, total, courtage, currency, isin "
+        "FROM transactions WHERE transaction_type='Utdelning' AND origin='avanza'"
+    )
+    dividends = cur.fetchall()
+    if not dividends:
+        return 0
+
+    routed = 0
+    for row in dividends:
+        rowid, tx_date, account, asset, amount, dps, total, courtage, currency, isin = row
+        cur.execute(
+            "SELECT ca.account, SUM(ca.amount) AS held "
+            "FROM cohort_assets ca JOIN assets a ON ca.asset_id = a.asset_id "
+            "WHERE a.asset = ? AND ca.amount > 0 GROUP BY ca.account",
+            (asset,)
+        )
+        holders = {r[0]: r[1] for r in cur.fetchall()}
+        if not holders:
+            continue
+        others = {acc: s for acc, s in holders.items() if acc != account}
+        if not others:
+            continue  # only the dividend's own account holds; leave
+        family = _account_family(account, virtual_map)
+        others = {acc: s for acc, s in others.items() if acc in family}
+        if not others:
+            continue  # only unrelated holders; leave
+
+        a_held = holders.get(account, 0)
+        # Per-holder distribution sized to actual holdings: own account first
+        # (reuses the original row), then each other holder (new rows).
+        distribution = []
+        if a_held > 1e-6:
+            distribution.append((account, a_held))
+        for acc, shares in others.items():
+            distribution.append((acc, shares))
+        if not distribution:
+            continue
+
+        first_acc, first_shares = distribution[0]
+        cur.execute(
+            "UPDATE transactions SET account = ?, amount = ?, total = ? WHERE rowid = ?",
+            (first_acc, first_shares, first_shares * dps, rowid)
+        )
+        for acc, shares in distribution[1:]:
+            cur.execute(
+                "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+                "VALUES (?, ?, 'Utdelning', ?, ?, ?, ?, ?, ?, ?, 'avanza')",
+                (tx_date, acc, asset, shares, dps, shares * dps, courtage, currency, isin)
+            )
+        logging.info(
+            f"Auto-distributed dividend on '{asset}' ({amount} shares) across holders: "
+            f"{[(a, round(s, 2)) for a, s in distribution]}."
+        )
         routed += 1
 
     if routed:

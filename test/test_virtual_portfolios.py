@@ -511,14 +511,15 @@ def test_virtual_close_nothing_to_close(tmp_path):
 # ---------- auto-routing of sells to the holding account ----------
 
 def _import_more(db_file, csv_text, tmp_path):
-    """Append transactions from a CSV, run sell-routing, then reprocess.
-    Returns the number of sells routed."""
+    """Append transactions from a CSV, run sell/dividend routing, then reprocess.
+    Returns the number of transactions routed/redistributed."""
     csv_file = _write_csv(tmp_path, "more.csv", csv_text)
     db = DatabaseHandler(db_file)
     db.connect()
     parser = DataParser(db)
     parser.add_data(csv_file)
     routed = cli.route_imported_sells_to_holders(db)
+    routed += cli.route_imported_dividends_to_holders(db)
     parser.reset_for_reprocessing()
     parser.process_transactions()
     db.disconnect()
@@ -591,3 +592,65 @@ def test_sell_routing_e2e_via_import_command(tmp_path):
     rc = cli.import_data(argparse.Namespace(database=str(db_file), special_cases=None, file=sell_file))
     assert rc == 0
     assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(70, abs=1e-6)
+
+
+# ---------- auto-distribution of dividends to holding accounts ----------
+
+# Utdelning: Antal = shares held, Kurs = dividend per share, Belopp = total.
+_DIV = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat\n"
+
+
+def test_dividend_routed_when_parent_holds_none(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+
+    parent_before = _account_value(DatabaseHandler(db_file), "1111")
+    yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
+
+    csv = _DIV + "2020-06-01;1111;Utdelning;Asset A;100;2;200;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 1
+    # Parent holds 0 -> entire dividend (100*2=200) credited to YOLO, none to parent
+    assert _account_value(DatabaseHandler(db_file), "1111") == pytest.approx(parent_before, abs=1)
+    assert _account_value(DatabaseHandler(db_file), "YOLO") == pytest.approx(yolo_before + 200, abs=1)
+
+
+def test_dividend_split_proportionally_when_both_hold(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    # Parent 60, YOLO 40
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+
+    parent_before = _account_value(DatabaseHandler(db_file), "1111")
+    yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
+
+    csv = _DIV + "2020-06-01;1111;Utdelning;Asset A;100;2;200;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 1
+    # Split 60/40: parent +120 (60*2), YOLO +80 (40*2)
+    assert _account_value(DatabaseHandler(db_file), "1111") == pytest.approx(parent_before + 120, abs=1)
+    assert _account_value(DatabaseHandler(db_file), "YOLO") == pytest.approx(yolo_before + 80, abs=1)
+
+
+def test_dividend_left_alone_when_only_parent_holds(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    # No allocation -> only parent holds; dividend stays put
+    parent_before = _account_value(DatabaseHandler(db_file), "1111")
+    csv = _DIV + "2020-06-01;1111;Utdelning;Asset A;100;2;200;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 0  # no virtuals -> no-op
+    assert _account_value(DatabaseHandler(db_file), "1111") == pytest.approx(parent_before + 200, abs=1)
+
+
+def test_dividend_routing_e2e_via_import_command(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
+
+    div_csv = _DIV + "2020-06-01;1111;Utdelning;Asset A;100;2;200;0;SEK;ASSETA;-"
+    div_file = _write_csv(tmp_path, "div.csv", div_csv)
+    rc = cli.import_data(argparse.Namespace(database=str(db_file), special_cases=None, file=div_file))
+    assert rc == 0
+    assert _account_value(DatabaseHandler(db_file), "YOLO") == pytest.approx(yolo_before + 200, abs=1)

@@ -438,8 +438,10 @@ python cli.py virtual close --name "YOLO" --date 2026-09-01
 
 ### Limitations
 
-- **Sells are auto-routed.** When an imported sell arrives on an account that does not hold the asset (e.g. you allocated the shares to a virtual), `import` automatically reassigns — or splits — the sell to the account that holds the shares, so reprocessing never aborts with an asset deficit. The rule: drain the sell's own account first, then the largest related virtual holder; ambiguous multi-holder cases route to the largest with a warning (re-allocate manually if you meant a different split). This runs only when virtual portfolios exist.
-- **Dividends** that arrive on the physical account are *not* auto-routed to the virtual — run `virtual allocate` on them if you want them attributed to the strategy.
+- **Sells and dividends are auto-routed.** When an imported sell or dividend arrives on an account that does not hold the asset (because the shares were allocated to a virtual), `import` automatically redistributes it to the account(s) that hold the shares, so reprocessing never aborts and income is attributed correctly:
+  - **Sells**: drain the sell's own account first, then the largest related virtual holder; full reassignment when the own account holds none, proportional split when it holds some but not enough. Multi-holder cases route to the largest with a warning.
+  - **Dividends**: split proportionally across every holder so each account is credited for the shares it actually holds.
+  - This runs only when virtual portfolios exist (no-op otherwise).
 - Funding a virtual requires the source account to hold enough capital at the transfer date.
 
 ## Special Cases
