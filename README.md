@@ -479,13 +479,6 @@ value, and a comparison table of physical / virtual / benchmark returns. It
 reuses the stats engine for APY and Yahoo Finance (when `--benchmark` is given)
 for the benchmark period return.
 
-### Grafana dashboard
-
-An importable Grafana dashboard that visualizes physical accounts with their
-virtual sub-portfolios lives in `grafana/`. It queries the SQLite database via
-the `frser-sqlite-datasource` plugin using the views above. See
-`grafana/README.md` for setup and the panel/query reference.
-
 ### Limitations
 
 - **Sells and dividends are auto-routed.** When an imported sell or dividend arrives on an account that does not hold the asset (because the shares were allocated to a virtual), `import` automatically redistributes it to the account(s) that hold the shares, so reprocessing never aborts and income is attributed correctly:
