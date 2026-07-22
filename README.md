@@ -436,6 +436,29 @@ python cli.py virtual close --name "YOLO" --date 2026-09-01
 - `accounts` shows a hierarchical tree: each physical account lists its combined value (self + its virtual children), with the children indented and marked `[V]`. The `TOTAL` row sums physical rows only (children are a breakdown, so nothing is double counted).
 - `stats` / `portfolio` default to **physical accounts only**. Pass `--account all` to include virtual portfolios, or `--account "YOLO"` to view a single virtual portfolio.
 
+### SQL views (for dashboards / reports)
+
+The SQLite database exposes virtual-portfolio-aware views that Grafana panels, weekly reports, or ad-hoc queries can consume directly. All views are recreated on every connect, so they always reflect the current schema.
+
+| View | One row per | Key columns |
+| :--- | :--- | :--- |
+| `v_account_current_valuations` | account | `account`, `is_virtual`, `parent_account`, `display_name`, `cash`, `assets`, `total` |
+| `v_account_asset_holdings` | (account, asset) | `account`, `is_virtual`, `parent_account`, `asset_name`, `held_amount` |
+| `v_virtual_portfolio_rollup` | **physical** account | `parent_account`, `own_total`, `virtual_total`, `combined_total`, `virtual_count` (+ own/virtual/combined cash & assets) |
+| `v_external_capital_flows` | capital-flow transaction | `date`, `account`, `transaction_type`, `origin`, `flow_amount` |
+
+`is_virtual`/`parent_account` let you group or filter (e.g. physical-only with `WHERE is_virtual = 0`, or hierarchy with `GROUP BY parent_account`). The rollup view gives the "main account including its virtuals" total with no double counting — `combined_total = own_total + virtual_total`. The flows view's `origin` (`'avanza'` vs `'virtual'`) lets you exclude internal virtual transfers when computing real money in/out.
+
+```sql
+-- Physical accounts with their virtual sub-portfolios rolled in:
+SELECT parent_display_name, own_total, virtual_total, combined_total
+FROM v_virtual_portfolio_rollup;
+
+-- Current holdings grouped by parent family:
+SELECT COALESCE(parent_account, account) AS family, asset_name, SUM(held_amount)
+FROM v_account_asset_holdings GROUP BY family, asset_name;
+```
+
 ### Limitations
 
 - **Sells and dividends are auto-routed.** When an imported sell or dividend arrives on an account that does not hold the asset (because the shares were allocated to a virtual), `import` automatically redistributes it to the account(s) that hold the shares, so reprocessing never aborts and income is attributed correctly:

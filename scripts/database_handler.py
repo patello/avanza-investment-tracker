@@ -276,70 +276,106 @@ class DatabaseHandler:
         except Exception:
             pass  # Column already exists
 
-        # Create helper SQL views
+        # Create helper SQL views (virtual-portfolio-aware, issue #74).
+        # Views are dropped and recreated on every connect, so enriching them
+        # needs no migration. Accounts without a row in `accounts` (e.g. raw
+        # physical accounts that only appear in transactions) default to
+        # is_virtual = 0 / parent_account = NULL via the LEFT JOIN + COALESCE.
         cursor.execute("DROP VIEW IF EXISTS v_account_asset_holdings;")
         cursor.execute("""
             CREATE VIEW v_account_asset_holdings AS
-            SELECT 
-                account, 
-                asset_name, 
-                SUM(amount) AS held_amount
-            FROM transactions
-            WHERE transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
-            GROUP BY account, asset_name
-            HAVING ABS(SUM(amount)) > 0.0001;
+                SELECT
+                    t.account,
+                    COALESCE(ac.is_virtual, 0) AS is_virtual,
+                    ac.parent_account,
+                    t.asset_name,
+                    SUM(t.amount) AS held_amount
+                FROM transactions t
+                LEFT JOIN accounts ac ON ac.account_id = t.account
+                WHERE t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                GROUP BY t.account, COALESCE(ac.is_virtual, 0), ac.parent_account, t.asset_name
+                HAVING ABS(SUM(t.amount)) > 0.0001;
         """)
 
         cursor.execute("DROP VIEW IF EXISTS v_account_current_valuations;")
         cursor.execute("""
             CREATE VIEW v_account_current_valuations AS
-            SELECT 
-                acc.account,
-                COALESCE((
-                    SELECT SUM(total) 
-                    FROM transactions 
-                    WHERE account = acc.account
-                ), 0.0) AS cash,
-                COALESCE((
-                    SELECT SUM(t.amount * a.latest_price)
-                    FROM transactions t
-                    JOIN assets a ON t.asset_name = a.asset
-                    WHERE t.account = acc.account 
-                      AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
-                ), 0.0) AS assets,
-                COALESCE((
-                    SELECT SUM(total) 
-                    FROM transactions 
-                    WHERE account = acc.account
-                ), 0.0) +
-                COALESCE((
-                    SELECT SUM(t.amount * a.latest_price)
-                    FROM transactions t
-                    JOIN assets a ON t.asset_name = a.asset
-                    WHERE t.account = acc.account 
-                      AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
-                ), 0.0) AS total
-            FROM (SELECT DISTINCT account FROM transactions) acc;
+                SELECT
+                    acc.account,
+                    COALESCE(ac.is_virtual, 0) AS is_virtual,
+                    ac.parent_account,
+                    COALESCE(ac.nickname, acc.account) AS display_name,
+                    COALESCE((
+                        SELECT SUM(total) FROM transactions WHERE account = acc.account
+                    ), 0.0) AS cash,
+                    COALESCE((
+                        SELECT SUM(t.amount * a.latest_price)
+                        FROM transactions t
+                        JOIN assets a ON t.asset_name = a.asset
+                        WHERE t.account = acc.account
+                          AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                    ), 0.0) AS assets,
+                    COALESCE((
+                        SELECT SUM(total) FROM transactions WHERE account = acc.account
+                    ), 0.0) +
+                    COALESCE((
+                        SELECT SUM(t.amount * a.latest_price)
+                        FROM transactions t
+                        JOIN assets a ON t.asset_name = a.asset
+                        WHERE t.account = acc.account
+                          AND t.transaction_type IN ('Köp', 'Sälj', 'Tillgångsinsättning', 'Värdepappersuttag', 'Byte')
+                    ), 0.0) AS total
+                FROM (SELECT DISTINCT account FROM transactions) acc
+                LEFT JOIN accounts ac ON ac.account_id = acc.account;
+        """)
+
+        # Per-physical-account rollup combining the account's own valuation with
+        # its virtual children, so dashboards/reports can show the hierarchy
+        # (e.g. "main account incl. virtuals") directly in SQL without double
+        # counting — children are summed once into the parent's combined_*.
+        cursor.execute("DROP VIEW IF EXISTS v_virtual_portfolio_rollup;")
+        cursor.execute("""
+            CREATE VIEW v_virtual_portfolio_rollup AS
+                SELECT
+                    p.account AS parent_account,
+                    p.display_name AS parent_display_name,
+                    p.cash AS own_cash,
+                    p.assets AS own_assets,
+                    p.total AS own_total,
+                    COALESCE(SUM(c.cash), 0.0)  AS virtual_cash,
+                    COALESCE(SUM(c.assets), 0.0) AS virtual_assets,
+                    COALESCE(SUM(c.total), 0.0)  AS virtual_total,
+                    p.cash    + COALESCE(SUM(c.cash), 0.0)  AS combined_cash,
+                    p.assets  + COALESCE(SUM(c.assets), 0.0) AS combined_assets,
+                    p.total   + COALESCE(SUM(c.total), 0.0)  AS combined_total,
+                    COUNT(c.account) AS virtual_count
+                FROM v_account_current_valuations p
+                LEFT JOIN accounts ca ON ca.parent_account = p.account AND COALESCE(ca.is_virtual, 0) = 1
+                LEFT JOIN v_account_current_valuations c ON c.account = ca.account_id
+                WHERE p.is_virtual = 0
+                GROUP BY p.account, p.display_name, p.cash, p.assets, p.total;
         """)
 
         cursor.execute("DROP VIEW IF EXISTS v_external_capital_flows;")
         cursor.execute("""
             CREATE VIEW v_external_capital_flows AS
-            SELECT 
-                date,
-                account,
-                transaction_type,
-                total AS flow_amount
-            FROM transactions
-            WHERE transaction_type IN ('Insättning', 'Autogiroinsättning', 'Uttag', 'Intern överföring')
-            UNION ALL
-            SELECT 
-                date,
-                account,
-                transaction_type,
-                amount * price AS flow_amount
-            FROM transactions
-            WHERE transaction_type = 'Tillgångsinsättning';
+                SELECT
+                    date,
+                    account,
+                    transaction_type,
+                    origin,
+                    total AS flow_amount
+                FROM transactions
+                WHERE transaction_type IN ('Insättning', 'Autogiroinsättning', 'Uttag', 'Intern överföring')
+                UNION ALL
+                SELECT
+                    date,
+                    account,
+                    transaction_type,
+                    origin,
+                    amount * price AS flow_amount
+                FROM transactions
+                WHERE transaction_type = 'Tillgångsinsättning';
         """)
 
         self.conn.commit()

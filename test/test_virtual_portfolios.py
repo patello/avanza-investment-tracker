@@ -654,3 +654,98 @@ def test_dividend_routing_e2e_via_import_command(tmp_path):
     rc = cli.import_data(argparse.Namespace(database=str(db_file), special_cases=None, file=div_file))
     assert rc == 0
     assert _account_value(DatabaseHandler(db_file), "YOLO") == pytest.approx(yolo_before + 200, abs=1)
+
+
+# ---------- virtual-aware SQL views ----------
+
+def _query_view(db_file, view, where=None, params=()):
+    """Read a view via a raw sqlite3 connection (views are persisted in the file)."""
+    conn = sqlite3.connect(str(db_file))
+    conn.row_factory = sqlite3.Row
+    try:
+        q = f"SELECT * FROM {view}"
+        if where:
+            q += f" WHERE {where}"
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _view_setup(tmp_path):
+    """Parent 1111 + virtual YOLO holding 40 of 100 Asset A shares."""
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"))
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    return db_file
+
+
+def test_view_current_valuations_is_virtual_aware(tmp_path):
+    db_file = _view_setup(tmp_path)
+    rows = {r["account"]: r for r in _query_view(db_file, "v_account_current_valuations")}
+    assert rows["YOLO"]["is_virtual"] == 1
+    assert rows["YOLO"]["parent_account"] == "1111"
+    assert rows["YOLO"]["display_name"] == "YOLO"
+    assert rows["1111"]["is_virtual"] == 0
+    assert rows["1111"]["parent_account"] is None
+
+
+def test_view_asset_holdings_is_virtual_aware(tmp_path):
+    db_file = _view_setup(tmp_path)
+    rows = _query_view(db_file, "v_account_asset_holdings", where="asset_name = ?", params=("Asset A",))
+    by_account = {r["account"]: r for r in rows}
+    # Parent kept 60, YOLO got 40 — both flagged correctly
+    assert by_account["1111"]["held_amount"] == pytest.approx(60, abs=1e-6)
+    assert by_account["1111"]["is_virtual"] == 0
+    assert by_account["YOLO"]["held_amount"] == pytest.approx(40, abs=1e-6)
+    assert by_account["YOLO"]["is_virtual"] == 1
+    assert by_account["YOLO"]["parent_account"] == "1111"
+
+
+def test_view_capital_flows_exposes_origin(tmp_path):
+    db_file = _view_setup(tmp_path)
+    rows = _query_view(db_file, "v_external_capital_flows")
+    origins = {r["origin"] for r in rows}
+    # Real deposit (avanza) + the virtual funding transfer pair (virtual)
+    assert "avanza" in origins
+    assert "virtual" in origins
+    # The origin column lets consumers filter real flows only
+    real_only = _query_view(db_file, "v_external_capital_flows", where="origin = 'avanza'")
+    assert all(r["origin"] == "avanza" for r in real_only)
+
+
+def test_view_rollup_combined_equals_own_plus_virtual(tmp_path):
+    db_file = _view_setup(tmp_path)
+    rows = _query_view(db_file, "v_virtual_portfolio_rollup")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["parent_account"] == "1111"
+    assert r["virtual_count"] == 1
+    # No double counting: combined = own + virtual
+    assert r["combined_cash"] == pytest.approx(r["own_cash"] + r["virtual_cash"])
+    assert r["combined_assets"] == pytest.approx(r["own_assets"] + r["virtual_assets"])
+    assert r["combined_total"] == pytest.approx(r["own_total"] + r["virtual_total"])
+    # And combined equals the parent's own + every child's total
+    valuations = {v["account"]: v for v in _query_view(db_file, "v_account_current_valuations")}
+    expected = valuations["1111"]["total"] + valuations["YOLO"]["total"]
+    assert r["combined_total"] == pytest.approx(expected)
+
+
+def test_view_rollup_no_virtuals(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    rows = _query_view(db_file, "v_virtual_portfolio_rollup")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["parent_account"] == "1111"
+    assert r["virtual_count"] == 0
+    # With no virtuals, combined == own
+    assert r["combined_total"] == pytest.approx(r["own_total"])
+    assert r["virtual_total"] == 0.0
+
+
+def test_view_rollup_excludes_virtual_accounts(tmp_path):
+    """The rollup must list physical accounts only — virtuals appear as children, not as parents."""
+    db_file = _view_setup(tmp_path)
+    rows = _query_view(db_file, "v_virtual_portfolio_rollup")
+    parents = {r["parent_account"] for r in rows}
+    assert "1111" in parents
+    assert "YOLO" not in parents
