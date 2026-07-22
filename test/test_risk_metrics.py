@@ -219,30 +219,21 @@ def test_beta_calculation(mock_get, risk_scenario_db):
 def cf_dominated_scenario_db(tmp_path):
     """
     Scenario that reproduces the cf-dominated first-period blow-up (task #2/#71):
-
-    - 2020-01-15: Small deposit 100 SEK (buys 1 share at 100 SEK)
-    - 2020-02-15: Large deposit 10000 SEK (sits as cash — no asset purchase)
-    - Prices: 100 (Jan 31), 100 (Feb 29), 110 (Mar 31)
-
-    Without the unreliable-period filter, period 1 (Jan 31 -> Feb 29) has:
-        v_start = 100 (1 share @ 100)
-        v_end   = 10100 (1 share @ 100 + 10000 cash)
-        cf      = 10000
-        r       = (10100 - 100 - 10000) / 100 = 0.0   (actually fine here)
-
-    To force a blow-up we make the second deposit hit before the asset is revalued
-    and make the first deposit tiny relative to the second:
         - 2020-01-15: Deposit 100, buy 1 share @ 100
-        - 2020-02-10: Deposit 10000 (cash)
+        - 2020-02-10: Deposit 10000 (cash, no purchase)
         - 2020-02-29 price = 50 (asset drops)
-    Period 1 (Jan 31 -> Feb 29):
-        v_start = 100 (1 share @ 100)
+
+    Period 2 (Jan 31 -> Feb 29) has:
+        v_start = 100   (1 share @ 100)
         v_end   = 10050 (1 share @ 50 + 10000 cash)
-        cf      = 10000
-        r       = (10050 - 100 - 10000) / 100 = -5.0  (-500%)
-    This -500% return would make max_drawdown < -100% and stddev ~huge.
-    After the fix, this period is flagged unreliable (v_start=100 < 0.5*10000=5000)
-    and excluded from risk metrics.
+        cf      = 10000 on Feb 10
+
+    Under simple Dietz the return is (10050 - 100 - 10000) / 100 = -500%,
+    which would push max_drawdown below -100% and inflate stddev. The fix is
+    Modified Dietz: the cash flow is time-weighted by how much of the period
+    it was invested, so weighted_cf = 10000 * 19/29 = 6551.72 and the return
+    becomes (10050 - 100 - 10000) / (100 + 6551.72) ~= -0.75%. The drawdown
+    index is also floored at 1e-9 so max_drawdown can never exceed 100%.
     """
     csv_content = """Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat
 2020-01-15;1111;Insättning;Deposit;-;-;100;0;SEK;;-

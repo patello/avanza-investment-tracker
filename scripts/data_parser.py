@@ -329,7 +329,8 @@ class DataParser:
         self.db.reset_table("cohort_cash_flows")
         self.db.commit()
 
-    def allocate_to_month(self, transaction_date: date) -> date:
+    @staticmethod
+    def allocate_to_month(transaction_date: date) -> date:
         """
         Takes a date and returns which month the transaction should be allocated to.
         If the transaction is made within the first cutoff_days of the month, allocate it to the previous month.
@@ -966,6 +967,14 @@ class DataParser:
             logging.warning(f"Not enough shares to remove for {asset}: have {total_asset_amount}, need {asset_amount}")
             raise AssetDeficit(f"Not enough shares to remove for {asset}", self)
 
+    def _on_transaction_processed(self, row: tuple) -> None:
+        """
+        Hook invoked after each transaction is processed (after dispatch,
+        before the next unprocessed row is fetched). Override to track
+        per-transaction state. The default implementation is a no-op.
+        """
+        pass
+
     def process_transactions(self, raise_on_unprocessed: bool = True) -> None:
         """
         Process transactions all transactions in the database that have not been processed yet.
@@ -1044,6 +1053,7 @@ class DataParser:
                     self.handle_ignore(row)
             else:
                 raise(ValueError)
+            self._on_transaction_processed(row)
             row = unprocessed_lines.fetchone()
 
         unprocessed_count = self.transaction_cur.execute("SELECT COUNT(*) FROM transactions WHERE processed == 0").fetchone()[0]

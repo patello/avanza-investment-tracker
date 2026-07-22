@@ -3,8 +3,12 @@ import os
 import time
 import math
 import logging
+import calendar
+import bisect
+import urllib.parse
+from collections import defaultdict
 import requests
-from datetime import date, datetime as datetime_cls
+from datetime import date, datetime
 from data_parser import DataParser, SpecialCases
 from database_handler import DatabaseHandler
 
@@ -19,6 +23,7 @@ class HistoricalTracker(DataParser):
         self.cohorts_end = cohorts_end
         # Map date -> { 'cash': {account: amount}, 'assets': {account: {asset_id: amount}} }
         self.history = {}
+        self.max_date_processed = None
 
     def get_current_state(self):
         """Query database tables to construct the current snapshot of cash and assets."""
@@ -58,107 +63,23 @@ class HistoricalTracker(DataParser):
             'assets': assets
         }
 
-    def process_transactions(self, raise_on_unprocessed: bool = True) -> None:
+    def _on_transaction_processed(self, row: tuple) -> None:
         """
-        Modified transaction processing loop that records portfolio holdings
-        state at the end of each date.
+        Snapshot holdings after each transaction. Only the last state of each
+        date is kept (later transactions on the same date overwrite it).
         """
-        unprocessed_lines = self.transaction_cur.execute(
-            "SELECT *, rowid FROM transactions WHERE processed == 0 ORDER BY date ASC, rowid ASC"
-        )
-        row = unprocessed_lines.fetchone()
-        
-        max_date_processed = None
-        while row is not None:
-            # Re-apply special cases if defined
-            if self.special_cases is not None:
-                row_data = row[:10]
-                updated_row_data = self.special_cases.handle_special_cases(row_data)
-                final_row_data = list(updated_row_data)
-                for idx in (4, 5, 6, 7):
-                    if isinstance(final_row_data[idx], str) and final_row_data[idx] not in ('-', ''):
-                        try:
-                            final_row_data[idx] = float(final_row_data[idx].replace(',', '.'))
-                        except ValueError:
-                            pass
-                updated_row_data = tuple(final_row_data)
-                if updated_row_data != row_data:
-                    rowid = row[11]
-                    self.data_cur.execute("""
-                        UPDATE transactions
-                        SET date = ?, account = ?, transaction_type = ?, asset_name = ?,
-                            amount = ?, price = ?, total = ?, courtage = ?, currency = ?, isin = ?
-                        WHERE rowid = ?
-                    """, updated_row_data + (rowid,))
-                    row = updated_row_data + (0, rowid)
-
-            t_date_str = row[0]
-            if isinstance(t_date_str, str):
-                t_date = datetime_cls.strptime(t_date_str, "%Y-%m-%d").date()
-            else:
-                t_date = t_date_str
-
-            tx_type = row[2]
-            if tx_type in ("Insättning", "Autogiroinsättning"):
-                self.handle_deposit(row)
-            elif tx_type == "Uttag":
-                self.handle_withdrawal(row)
-            elif tx_type == "Köp":
-                self.handle_purchase(row)
-            elif tx_type == "Sälj":
-                self.handle_sale(row)
-            elif tx_type == "Utdelning":
-                self.handle_dividend(row)
-            elif tx_type in ("Räntor", "Ränta", "Inlåningsränta", "Utlåningsränta", "Uttag av riskkostnad"):
-                if row[6] > 0:
-                    self.handle_interest(row)
-                else:
-                    self.handle_fees(row)
-            elif tx_type == "Utbokning fraktioner":
-                self.handle_ignore(row)
-            elif any(tax in tx_type for tax in ("Utländsk källskatt", "Prelskatt", "Preliminärskatt", "Avkastningsskatt")):
-                self.handle_fees(row)
-            elif "Byte" in tx_type or tx_type == "Övrigt":
-                self.handle_listing_change(row)
-            elif tx_type == "Tillgångsinsättning":
-                self.handle_asset_deposit(row)
-            elif tx_type == "Intern överföring":
-                self.handle_internal_transfer(row)
-            elif tx_type == "Värdepappersinsättning":
-                self.handle_ignore(row)
-            elif tx_type == "Värdepappersuttag":
-                if row[4] < 0:
-                    self.handle_remove_shares(row)
-                else:
-                    self.handle_ignore(row)
-            else:
-                raise ValueError(f"Unknown transaction type: {tx_type}")
-
-            # Record state after processing this transaction
-            if max_date_processed is None or t_date >= max_date_processed:
-                max_date_processed = t_date
-                self.history[t_date] = self.get_current_state()
-            row = unprocessed_lines.fetchone()
-
-        unprocessed_count = self.transaction_cur.execute(
-            "SELECT COUNT(*) FROM transactions WHERE processed == 0"
-        ).fetchone()[0]
-        
-        if unprocessed_count > 0:
-            if raise_on_unprocessed:
-                from data_parser import AssetDeficit
-                raise AssetDeficit(
-                    f"There are {unprocessed_count} transaction(s) that could not be processed "
-                    "due to a mismatch of assets in the database", self
-                )
-            else:
-                logging.warning(f"There are {unprocessed_count} transaction(s) left unprocessed (normal for temporary historical snapshots)")
+        t_date_str = row[0]
+        if isinstance(t_date_str, str):
+            t_date = datetime.strptime(t_date_str, "%Y-%m-%d").date()
+        else:
+            t_date = t_date_str
+        if self.max_date_processed is None or t_date >= self.max_date_processed:
+            self.max_date_processed = t_date
+            self.history[t_date] = self.get_current_state()
 
 
 def generate_monthly_dates(start_date: date, end_date: date) -> list:
     """Generate monthly end-of-month dates between start_date and end_date."""
-    import calendar
-    
     dates = []
     # Start with the end of the month prior to start_date
     if start_date.month == 1:
@@ -199,7 +120,6 @@ def generate_monthly_dates(start_date: date, end_date: date) -> list:
 
 def get_holdings_at_date(history: dict, target_date: date, accounts_filter: list) -> tuple:
     """Find the holdings (cash and asset shares) as of a target date."""
-    import bisect
     tx_dates = sorted(history.keys())
     idx = bisect.bisect_right(tx_dates, target_date)
     
@@ -273,7 +193,7 @@ def fetch_riksbanken_rate(from_date: date, to_date: date) -> float:
                     if 'value' in obs and 'date' in obs:
                         obs_date_str = obs['date']
                         try:
-                            obs_date = datetime_cls.strptime(obs_date_str, "%Y-%m-%d").date()
+                            obs_date = datetime.strptime(obs_date_str, "%Y-%m-%d").date()
                         except (ValueError, TypeError):
                             continue
                         parsed.append({'date': obs_date, 'value': float(obs['value'])})
@@ -299,9 +219,6 @@ def clear_riksbanken_cache():
 
 def fetch_yahoo_benchmark_prices(ticker: str, start_date: date, end_date: date) -> list:
     """Fetch daily closing prices for a benchmark ticker from Yahoo Finance."""
-    import urllib.parse
-    import time
-    
     encoded_ticker = urllib.parse.quote(ticker)
     start_ts = int(time.mktime(start_date.timetuple()))
     end_ts = int(time.mktime(end_date.timetuple()))
@@ -344,7 +261,6 @@ def get_benchmark_price(bench_prices: list, target_date: date) -> float:
     """Get the benchmark price closest to or on the target date."""
     if not bench_prices:
         return 0.0
-    import bisect
     dates = [x[0] for x in bench_prices]
     idx = bisect.bisect_right(dates, target_date)
     if idx == 0:
@@ -382,11 +298,11 @@ class RiskCalculator:
         if to_date is None:
             to_date = date.today()
         elif isinstance(to_date, str):
-            to_date = datetime_cls.strptime(to_date, "%Y-%m-%d").date()
+            to_date = datetime.strptime(to_date, "%Y-%m-%d").date()
             
         from_date = self.from_date
         if isinstance(from_date, str):
-            from_date = datetime_cls.strptime(from_date, "%Y-%m-%d").date()
+            from_date = datetime.strptime(from_date, "%Y-%m-%d").date()
             
         if from_date is None:
             if self.cohorts_start is not None:
@@ -402,7 +318,7 @@ class RiskCalculator:
                 first_tx_date = row[0] if row else None
                 if first_tx_date:
                     if isinstance(first_tx_date, str):
-                        from_date = datetime_cls.strptime(first_tx_date, "%Y-%m-%d").date()
+                        from_date = datetime.strptime(first_tx_date, "%Y-%m-%d").date()
                     else:
                         from_date = first_tx_date
                 else:
@@ -413,7 +329,7 @@ class RiskCalculator:
             raise ValueError(f"Start date {from_date} cannot be after end date {to_date}")
 
         # 2. Reconstruct historical holdings state
-        history, deposits_by_month, cf_by_month = self.get_historical_holdings(to_date)
+        history, cf_by_month = self.get_historical_holdings(to_date)
         sampling_dates = generate_monthly_dates(from_date, to_date)
         
         # 3. Calculate portfolio values at each monthly end date
@@ -448,19 +364,7 @@ class RiskCalculator:
         #    Withdrawals: cohort_data.withdrawal (correctly scoped — large
         #    withdrawals that pull pre-cohort capital are excluded by the
         #    cohort system), approximated at mid-month for timing.
-        from collections import defaultdict
-        import calendar as _cal
         cash_flows_by_date = defaultdict(float)
-
-        def _alloc_month(tx_date):
-            cutoff = 10
-            y, m, d = tx_date.year, tx_date.month, tx_date.day
-            if d <= cutoff:
-                if m > 1:
-                    m -= 1
-                else:
-                    m, y = 12, y - 1
-            return date(y, m, _cal.monthrange(y, m)[1])
 
         # Build cash flows from raw transactions with actual dates.
         # Deposits (Insättning etc.) are always included. For non-cohort
@@ -488,14 +392,14 @@ class RiskCalculator:
         cur.execute(query, params)
         for date_str, tx_type, total, amount, price in cur.fetchall():
             if isinstance(date_str, str):
-                tx_date = datetime_cls.strptime(date_str, "%Y-%m-%d").date()
+                tx_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             else:
                 tx_date = date_str
 
             # For cohort mode, only include transactions whose allocation
             # month is within the cohort range.
             if is_cohort:
-                am = _alloc_month(tx_date)
+                am = DataParser.allocate_to_month(tx_date)
                 if self.cohorts_start is not None and am < self.cohorts_start:
                     continue
                 if self.cohorts_end is not None and am > self.cohorts_end:
@@ -520,7 +424,7 @@ class RiskCalculator:
         # use mid-month approximation.
         if is_cohort:
             for m_str, cf_amt in cf_by_month.items():
-                m_date = datetime_cls.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
+                m_date = datetime.strptime(m_str, "%Y-%m-%d").date() if isinstance(m_str, str) else m_str
                 uttags = uttag_by_alloc.get(m_date, [])
                 raw_total = sum(t for _, t in uttags)
                 if uttags and abs(raw_total) > 0.01:
@@ -546,16 +450,6 @@ class RiskCalculator:
                     if t_start < d <= t_end:
                         flows.append((d, cf))
             period_cash_flows.append(flows)
-
-        # Cash flows that predate the first sampling date (e.g. deposits
-        # allocated to a month before the leading-zero trim point) are
-        # reassigned to the first period with the start date as their
-        # effective date, giving them a time weight of 1.0 (invested for
-        # the full period). This prevents the trim from losing cash flows.
-        if period_cash_flows:
-            for d, cf in cash_flows_by_date.items():
-                if d < sampling_dates[0]:
-                    period_cash_flows[0].append((sampling_dates[0], cf))
 
         # Per-period cash-flow totals (used by year_returns in section 11).
         cash_flows = [sum(amt for _, amt in flows) for flows in period_cash_flows]
@@ -768,24 +662,12 @@ class RiskCalculator:
         try:
             tracker.process_transactions(raise_on_unprocessed=False)
             history = tracker.history
-            
-            # Query cohort-specific deposits and cash flows
+
+            # Query cohort-specific cash flows (withdrawals, fees, taxes).
+            # Keyed by transaction_month so the caller can distribute each
+            # month's total across the actual Uttag transaction dates for
+            # Modified Dietz time-weighting.
             cur = temp_db.get_cursor()
-            
-            query_dep = "SELECT month, SUM(deposit) - COALESCE(SUM(withdrawal), 0) FROM cohort_data"
-            params_dep = []
-            if self.cohorts_start or self.cohorts_end:
-                query_dep += " WHERE 1=1"
-                if self.cohorts_start:
-                    query_dep += " AND month >= ?"
-                    params_dep.append(self.cohorts_start.isoformat())
-                if self.cohorts_end:
-                    query_dep += " AND month <= ?"
-                    params_dep.append(self.cohorts_end.isoformat())
-            query_dep += " GROUP BY month"
-            cur.execute(query_dep, params_dep)
-            deposits_by_month = {row[0]: row[1] for row in cur.fetchall()}
-            
             query_cf = "SELECT transaction_month, SUM(amount) FROM cohort_cash_flows"
             params_cf = []
             if self.cohorts_start or self.cohorts_end:
@@ -799,8 +681,6 @@ class RiskCalculator:
             query_cf += " GROUP BY transaction_month"
             cur.execute(query_cf, params_cf)
             cf_by_month = {row[0]: row[1] for row in cur.fetchall()}
-
-            # Query withdrawals from cohort_data (correctly cohort-scoped).
         finally:
             temp_db.disconnect()
             try:
@@ -808,4 +688,4 @@ class RiskCalculator:
             except Exception:
                 pass
 
-        return history, deposits_by_month, cf_by_month
+        return history, cf_by_month
