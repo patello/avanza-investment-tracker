@@ -56,7 +56,7 @@ python cli.py status
 python cli.py settings default-accounts "account1,savings_account"
 
 # 5. (Optional) Set account nicknames for readability
-python cli.py settings account-nickname 1234567 "Savings"
+python cli.py account nickname 1234567 "Savings"
 
 # 6. View account summaries
 python cli.py accounts --update-prices auto
@@ -120,13 +120,13 @@ Assign human-readable names to account numbers for easier identification:
 
 ```bash
 # Set a nickname for an account
-python cli.py settings account-nickname 1234567 "Savings"
+python cli.py account nickname 1234567 "Savings"
 
 # List all nicknames
-python cli.py settings account-nickname --list
+python cli.py account nickname --list
 
 # Remove a nickname
-python cli.py settings account-nickname --remove 1234567
+python cli.py account nickname --remove 1234567
 ```
 
 Nicknames are stored in the database and displayed in the `accounts` command output alongside account numbers.
@@ -307,7 +307,7 @@ The unified CLI provides all functionality in a streamlined interface:
 2. Import and process transactions: `python cli.py import data/your_transactions.csv`
 3. View statistics with automatic price updates: `python cli.py stats --update-prices auto`
 4. (Optional) Set default accounts for filtering: `python cli.py settings default-accounts "account1,savings_account"`
-5. (Optional) Set account nicknames: `python cli.py settings account-nickname 1234567 "Savings"`
+5. (Optional) Set account nicknames: `python cli.py account nickname 1234567 "Savings"`
 6. View account summaries: `python cli.py accounts --update-prices auto`
 7. View portfolio snapshot or compare change over a period (equivalent to `stats --positions --summary`):
     - Snapshot: `python cli.py portfolio [--as-of YYYY-MM-DD]`
@@ -355,7 +355,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 | `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
-| `python scripts/cli.py virtual SUBCOMMAND` | Manage virtual portfolios — sub-portfolios within a physical account (see below) |
+| `python scripts/cli.py account SUBCOMMAND` | Manage accounts — virtual sub-portfolios (create/allocate/transfer/list/close) and nicknames (see below) |
 | `python scripts/cli.py report [OPTIONS]` | Investment report with a virtual-portfolio section and a virtual-vs-parent-vs-benchmark comparison |
 
 ### Global Options
@@ -397,32 +397,38 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 ### Settings Subcommands
 - `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)
 - `default-stats-period {month,year}`: Set default period for performance reports
-- `account-nickname [ACCOUNT] [NICKNAME]`: Set or list nicknames (`--list` to show all, `--remove ACCOUNT` to delete)
 
 ## Virtual Portfolios
 
 Virtual portfolios let you track sub-strategies (e.g. "YOLO bets", "long-term holds") *within* a single physical Avanza account. A virtual portfolio is just another account in the database (`is_virtual = 1`, linked to a parent). Because shares are **reassigned** (not copied) to the virtual account, every share and every SEK lives on exactly one account at a time — aggregates do not double count.
 
+All account management — sub-portfolios **and** nicknames — lives under the `account` command.
+
 ### Commands
 
 ```bash
-# Create a virtual portfolio under a physical parent (optionally fund it)
-python cli.py virtual create --name "YOLO" --parent 1234567 [--starting-cash 5000 --starting-cash-date 2026-07-19]
+# Create a virtual sub-portfolio under a physical parent (optionally fund it)
+python cli.py account create --name "YOLO" --parent 1234567 [--starting-cash 5000 --starting-cash-date 2026-07-19]
 
 # Allocate an imported transaction (full, or partial via --shares)
-python cli.py virtual allocate --tx-date 2026-07-19 --tx-asset "Some Meme Stock" --to "YOLO" [--shares 50]
+python cli.py account allocate --tx-date 2026-07-19 --tx-asset "Some Meme Stock" --to "YOLO" [--shares 50]
 
 # Move cash between accounts
-python cli.py virtual transfer-cash --amount 10000 --from 1234567 --to "YOLO" --date 2026-07-19
+python cli.py account transfer-cash --amount 10000 --from 1234567 --to "YOLO" --date 2026-07-19
 
 # Move an asset position between accounts
-python cli.py virtual transfer --asset "Tesla" --shares 50 --from "YOLO" --to 1234567 --date 2026-09-01
+python cli.py account transfer --asset "Tesla" --shares 50 --from "YOLO" --to 1234567 --date 2026-09-01
 
-# List virtual portfolios with current value and APY
-python cli.py virtual list [--apy-mode twrr] [--format json]
+# List virtual sub-portfolios with current value and APY
+python cli.py account list [--apy-mode twrr] [--format json]
 
-# Close a virtual: move all holdings + residual cash back to its parent
-python cli.py virtual close --name "YOLO" --date 2026-09-01
+# Close a sub-portfolio: move all holdings + residual cash back to its parent
+python cli.py account close --name "YOLO" --date 2026-09-01
+
+# Account nicknames (moved here from `settings account-nickname`)
+python cli.py account nickname 1234567 "Main"
+python cli.py account nickname --list
+python cli.py account nickname --remove 1234567
 ```
 
 ### How it works
@@ -430,7 +436,7 @@ python cli.py virtual close --name "YOLO" --date 2026-09-01
 - **`allocate`** moves a transaction (or splits it) onto the virtual account. Moving a buy automatically transfers the buy's cost from the parent so the virtual can fund it. Partial splits proportionally divide `total` and `courtage`.
 - **`transfer`** (asset move) is represented internally as a sell on the source → cash transfer → rebuy on the destination (all tagged as synthetic). This composes the existing transaction handlers and is correct on every statistics path. The **source realizes its gain** up to the transfer and the **destination gets a fresh cost basis** at the transfer price — an honest "this position left / entered the strategy" bookkeeping.
 - **`close`** moves every holding (via the same decomposition) plus any residual cash back to the parent, then reprocesses. The virtual account row is **preserved** (kept `is_virtual = 1`) so its historical cohort/performance data remains queryable; it simply ends up empty.
-- After every virtual mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
+- After every `account` mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
 
 ### Viewing virtual portfolios
 

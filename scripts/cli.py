@@ -1245,7 +1245,7 @@ def settings_default_accounts(args):
     return 0
 
 
-def settings_account_nickname(args):
+def account_nickname(args):
     """Set or remove account nicknames."""
     db = get_db(args)
     
@@ -1725,7 +1725,7 @@ def _insert_internal_transfer_pair(db, from_acc, to_acc, amount, tx_date):
     return True
 
 
-def virtual_create(args):
+def account_create(args):
     """Create a virtual portfolio under a parent (physical) account."""
     db = get_db(args)
     db.connect()
@@ -1768,7 +1768,7 @@ def virtual_create(args):
     return 0
 
 
-def virtual_allocate(args):
+def account_allocate(args):
     """Allocate a transaction (full or partial split) to a virtual portfolio."""
     db = get_db(args)
     db.connect()
@@ -1870,7 +1870,7 @@ def virtual_allocate(args):
     return 0
 
 
-def virtual_transfer_cash(args):
+def account_transfer_cash(args):
     """Move cash between accounts via an internal transfer pair."""
     db = get_db(args)
     db.connect()
@@ -1934,7 +1934,7 @@ def _perform_asset_transfer(db, from_acc, to_acc, asset, shares, tx_date):
     return (proceeds, price)
 
 
-def virtual_transfer(args):
+def account_transfer(args):
     """Move an asset position between accounts.
 
     Implemented as a decomposition (sell -> cash transfer -> rebuy), all rows
@@ -1983,7 +1983,7 @@ def virtual_transfer(args):
     return 0
 
 
-def virtual_list(args):
+def account_list(args):
     """List all virtual portfolios with parent, cash, assets, total and APY."""
     db = get_db(args)
     db.connect()
@@ -2035,7 +2035,7 @@ def virtual_list(args):
     return 0
 
 
-def virtual_close(args):
+def account_close(args):
     """Move all holdings and residual cash from a virtual portfolio back to a
     destination (its parent by default). The virtual account row is preserved so
     its historical cohort data remains available; it simply ends up empty."""
@@ -2549,15 +2549,7 @@ Examples:
     default_accounts_parser = settings_subparsers.add_parser('default-accounts', help='Set default accounts')
     default_accounts_parser.add_argument('accounts', help='Comma-separated list of account numbers, or "all" for all accounts')
     default_accounts_parser.set_defaults(func=settings_default_accounts)
-    
-    # Account nickname subcommand
-    account_nickname_parser = settings_subparsers.add_parser('account-nickname', help='Set or remove account nicknames')
-    account_nickname_parser.add_argument('account', nargs='?', help='Account number to set nickname for')
-    account_nickname_parser.add_argument('nickname', nargs='?', help='Nickname for the account')
-    account_nickname_parser.add_argument('--remove', metavar='ACCOUNT', help='Remove nickname for specified account')
-    account_nickname_parser.add_argument('--list', action='store_true', help='List all account nicknames')
-    account_nickname_parser.set_defaults(func=settings_account_nickname)
-    
+
     # Accounts command (show account summaries)
     accounts_parser = subparsers.add_parser('accounts', help='Show account summaries with asset values and cash')
     accounts_parser.add_argument(
@@ -2673,51 +2665,59 @@ Examples:
     export_parser.set_defaults(func=export_transactions)
 
     # Virtual portfolios command group (issue #74)
-    virtual_parser = subparsers.add_parser(
-        'virtual', help='Manage virtual portfolios (sub-portfolios within a physical account)'
+    account_parser = subparsers.add_parser(
+        'account', help='Manage accounts: virtual sub-portfolios and nicknames'
     )
-    virtual_sub = virtual_parser.add_subparsers(dest='virtual_command')
+    account_sub = account_parser.add_subparsers(dest='account_command')
 
-    vp_create = virtual_sub.add_parser('create', help='Create a virtual portfolio under a parent account')
-    vp_create.add_argument('--name', required=True, help='Name for the virtual portfolio (used as its account ID)')
-    vp_create.add_argument('--parent', required=True, help='Parent (physical) account ID or nickname')
-    vp_create.add_argument('--starting-cash', type=float, default=None, help='Optional starting cash to transfer from parent')
-    vp_create.add_argument('--starting-cash-date', default=None, help='Date for the starting cash transfer (YYYY-MM-DD; default today)')
-    vp_create.set_defaults(func=virtual_create)
+    ap_create = account_sub.add_parser('create', help='Create a virtual sub-portfolio under a parent account')
+    ap_create.add_argument('--name', required=True, help='Name for the sub-portfolio (used as its account ID)')
+    ap_create.add_argument('--parent', required=True, help='Parent (physical) account ID or nickname')
+    ap_create.add_argument('--starting-cash', type=float, default=None, help='Optional starting cash to transfer from parent')
+    ap_create.add_argument('--starting-cash-date', default=None, help='Date for the starting cash transfer (YYYY-MM-DD; default today)')
+    ap_create.set_defaults(func=account_create)
 
-    vp_alloc = virtual_sub.add_parser('allocate', help='Allocate a transaction (full or partial split) to a virtual portfolio')
-    vp_alloc.add_argument('--tx-date', required=True, help='Transaction date (YYYY-MM-DD)')
-    vp_alloc.add_argument('--tx-asset', required=True, help='Asset name of the transaction')
-    vp_alloc.add_argument('--to', required=True, help='Virtual portfolio to allocate to')
-    vp_alloc.add_argument('--from', dest='from_account', default=None, help="Source account (default: virtual portfolio's parent)")
-    vp_alloc.add_argument('--shares', type=float, default=None, help='Shares to allocate (partial split); omit for full allocation')
-    vp_alloc.set_defaults(func=virtual_allocate)
+    ap_alloc = account_sub.add_parser('allocate', help='Allocate a transaction (full or partial split) to a virtual sub-portfolio')
+    ap_alloc.add_argument('--tx-date', required=True, help='Transaction date (YYYY-MM-DD)')
+    ap_alloc.add_argument('--tx-asset', required=True, help='Asset name of the transaction')
+    ap_alloc.add_argument('--to', required=True, help='Virtual sub-portfolio to allocate to')
+    ap_alloc.add_argument('--from', dest='from_account', default=None, help="Source account (default: the sub-portfolio's parent)")
+    ap_alloc.add_argument('--shares', type=float, default=None, help='Shares to allocate (partial split); omit for full allocation')
+    ap_alloc.set_defaults(func=account_allocate)
 
-    vp_cash = virtual_sub.add_parser('transfer-cash', help='Move cash between accounts')
-    vp_cash.add_argument('--amount', type=float, required=True, help='Amount (SEK) to transfer')
-    vp_cash.add_argument('--from', dest='from_account', required=True, help='Source account')
-    vp_cash.add_argument('--to', required=True, help='Destination account')
-    vp_cash.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
-    vp_cash.set_defaults(func=virtual_transfer_cash)
+    ap_cash = account_sub.add_parser('transfer-cash', help='Move cash between accounts')
+    ap_cash.add_argument('--amount', type=float, required=True, help='Amount (SEK) to transfer')
+    ap_cash.add_argument('--from', dest='from_account', required=True, help='Source account')
+    ap_cash.add_argument('--to', required=True, help='Destination account')
+    ap_cash.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
+    ap_cash.set_defaults(func=account_transfer_cash)
 
-    vp_xfer = virtual_sub.add_parser('transfer', help='Move an asset position between accounts (sell -> cash -> rebuy)')
-    vp_xfer.add_argument('--asset', required=True, help='Asset name to transfer')
-    vp_xfer.add_argument('--shares', type=float, required=True, help='Number of shares to transfer')
-    vp_xfer.add_argument('--from', dest='from_account', required=True, help='Source account')
-    vp_xfer.add_argument('--to', required=True, help='Destination account')
-    vp_xfer.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
-    vp_xfer.set_defaults(func=virtual_transfer)
+    ap_xfer = account_sub.add_parser('transfer', help='Move an asset position between accounts (sell -> cash -> rebuy)')
+    ap_xfer.add_argument('--asset', required=True, help='Asset name to transfer')
+    ap_xfer.add_argument('--shares', type=float, required=True, help='Number of shares to transfer')
+    ap_xfer.add_argument('--from', dest='from_account', required=True, help='Source account')
+    ap_xfer.add_argument('--to', required=True, help='Destination account')
+    ap_xfer.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
+    ap_xfer.set_defaults(func=account_transfer)
 
-    vp_list = virtual_sub.add_parser('list', help='List all virtual portfolios with value and APY')
-    vp_list.add_argument('--apy-mode', choices=['mwrr', 'twrr'], default='mwrr', help='APY calculation method (default: mwrr)')
-    vp_list.add_argument('--format', choices=['table', 'json'], default='table', help='Output format (default: table)')
-    vp_list.set_defaults(func=virtual_list)
+    ap_list = account_sub.add_parser('list', help='List all virtual sub-portfolios with value and APY')
+    ap_list.add_argument('--apy-mode', choices=['mwrr', 'twrr'], default='mwrr', help='APY calculation method (default: mwrr)')
+    ap_list.add_argument('--format', choices=['table', 'json'], default='table', help='Output format (default: table)')
+    ap_list.set_defaults(func=account_list)
 
-    vp_close = virtual_sub.add_parser('close', help='Move all holdings and cash back to parent (liquidate/merge a virtual)')
-    vp_close.add_argument('--name', required=True, help='Virtual portfolio to close')
-    vp_close.add_argument('--to', default=None, help='Destination account (default: the virtual\'s parent)')
-    vp_close.add_argument('--date', required=True, help='Close date (YYYY-MM-DD)')
-    vp_close.set_defaults(func=virtual_close)
+    ap_close = account_sub.add_parser('close', help='Move all holdings and cash back to parent (liquidate/merge a sub-portfolio)')
+    ap_close.add_argument('--name', required=True, help='Virtual sub-portfolio to close')
+    ap_close.add_argument('--to', default=None, help="Destination account (default: the sub-portfolio's parent)")
+    ap_close.add_argument('--date', required=True, help='Close date (YYYY-MM-DD)')
+    ap_close.set_defaults(func=account_close)
+
+    # Nickname management (moved here from `settings account-nickname`)
+    ap_nick = account_sub.add_parser('nickname', help='Set, list, or remove account nicknames')
+    ap_nick.add_argument('account', nargs='?', help='Account to set nickname for')
+    ap_nick.add_argument('nickname', nargs='?', help='Nickname for the account')
+    ap_nick.add_argument('--remove', metavar='ACCOUNT', help='Remove nickname for specified account')
+    ap_nick.add_argument('--list', action='store_true', help='List all account nicknames')
+    ap_nick.set_defaults(func=account_nickname)
 
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
@@ -2757,8 +2757,8 @@ Examples:
         parser.print_help()
         return 1
 
-    if args.command == 'virtual' and not getattr(args, 'virtual_command', None):
-        virtual_parser.print_help()
+    if args.command == 'account' and not getattr(args, 'account_command', None):
+        account_parser.print_help()
         return 1
 
     return args.func(args)

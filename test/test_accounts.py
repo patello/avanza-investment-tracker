@@ -174,7 +174,7 @@ def test_remove_nickname_deletes_empty_physical_row(tmp_path):
 
 def test_virtual_create_inserts_account(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    rc = cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     assert rc == 0
     db = DatabaseHandler(db_file)
     db.connect()
@@ -186,14 +186,14 @@ def test_virtual_create_inserts_account(tmp_path):
 
 def test_virtual_create_rejects_nested_virtual_parent(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    rc = cli.virtual_create(_ns(db_file, name="NESTED", parent="YOLO", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_create(_ns(db_file, name="NESTED", parent="YOLO", starting_cash=None, starting_cash_date=None))
     assert rc == 1
 
 
 def test_virtual_create_with_starting_cash_funds(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    rc = cli.virtual_create(_ns(
+    rc = cli.account_create(_ns(
         db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
     ))
     assert rc == 0
@@ -206,8 +206,8 @@ def test_virtual_create_with_starting_cash_funds(tmp_path):
 
 def test_allocate_full_moves_shares(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    rc = cli.virtual_allocate(_ns(
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_allocate(_ns(
         db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
     ))
     assert rc == 0
@@ -217,8 +217,8 @@ def test_allocate_full_moves_shares(tmp_path):
 
 def test_allocate_partial_split_math(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    rc = cli.virtual_allocate(_ns(
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_allocate(_ns(
         db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=30
     ))
     assert rc == 0
@@ -244,9 +244,9 @@ def test_allocate_partial_split_math(tmp_path):
 
 def test_transfer_cash_moves_capital(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     parent_before = _account_value(DatabaseHandler(db_file), "1111")
-    rc = cli.virtual_transfer_cash(_ns(
+    rc = cli.account_transfer_cash(_ns(
         db_file, amount=4000.0, from_account="1111", to="YOLO", date="2020-03-01"
     ))
     assert rc == 0
@@ -261,10 +261,10 @@ def test_transfer_cash_moves_capital(tmp_path):
 
 def test_transfer_asset_capital_neutral_flat_price(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     total_before = _account_value(DatabaseHandler(db_file), "1111") + _account_value(DatabaseHandler(db_file), "YOLO")
 
-    rc = cli.virtual_transfer(_ns(
+    rc = cli.account_transfer(_ns(
         db_file, asset="Asset A", shares=50, from_account="1111", to="YOLO", date="2020-04-01"
     ))
     assert rc == 0
@@ -279,9 +279,9 @@ def test_transfer_asset_capital_neutral_flat_price(tmp_path):
 
 def test_transfer_asset_realizes_gain_at_source(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     # Transfer 50 shares at flat price 100 first
-    cli.virtual_transfer(_ns(
+    cli.account_transfer(_ns(
         db_file, asset="Asset A", shares=50, from_account="1111", to="YOLO", date="2020-04-01"
     ))
     # Now price rises to 200
@@ -308,8 +308,8 @@ def test_transfer_asset_realizes_gain_at_source(tmp_path):
 
 def test_transfer_asset_rejects_insufficient_shares(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    rc = cli.virtual_transfer(_ns(
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_transfer(_ns(
         db_file, asset="Asset A", shares=500, from_account="1111", to="YOLO", date="2020-04-01"
     ))
     assert rc == 1  # only 100 shares held
@@ -319,8 +319,8 @@ def test_transfer_asset_rejects_insufficient_shares(tmp_path):
 
 def test_reimport_after_full_allocate_does_not_duplicate(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
         db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
     ))
 
@@ -356,8 +356,8 @@ def test_reimport_after_full_allocate_does_not_duplicate(tmp_path):
 
 def test_reimport_after_partial_split_sum_matches(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
         db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=30
     ))
 
@@ -390,7 +390,7 @@ def test_reimport_after_partial_split_sum_matches(tmp_path):
 
 def test_resolve_accounts_physical_only_when_virtuals_exist(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     db = DatabaseHandler(db_file)
     db.connect()
     # Unspecified -> physical only
@@ -413,7 +413,7 @@ def test_resolve_accounts_none_when_no_virtuals(tmp_path):
 
 def test_virtual_list_empty(tmp_path, capsys):
     db_file = _base_parent_db(tmp_path)
-    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='table'))
+    rc = cli.account_list(_ns(db_file, apy_mode='mwrr', format='table'))
     assert rc == 0
     out = capsys.readouterr().out
     assert "No virtual portfolios" in out
@@ -421,10 +421,10 @@ def test_virtual_list_empty(tmp_path, capsys):
 
 def test_virtual_list_shows_portfolio_with_value(tmp_path, capsys):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(
+    cli.account_create(_ns(
         db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
     ))
-    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='table'))
+    rc = cli.account_list(_ns(db_file, apy_mode='mwrr', format='table'))
     assert rc == 0
     out = capsys.readouterr().out
     assert "YOLO" in out
@@ -433,10 +433,10 @@ def test_virtual_list_shows_portfolio_with_value(tmp_path, capsys):
 
 def test_virtual_list_json(tmp_path, capsys):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(
+    cli.account_create(_ns(
         db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
     ))
-    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='json'))
+    rc = cli.account_list(_ns(db_file, apy_mode='mwrr', format='json'))
     assert rc == 0
     import json
     data = json.loads(capsys.readouterr().out)
@@ -451,18 +451,18 @@ def test_virtual_list_json(tmp_path, capsys):
 
 def test_virtual_close_empties_virtual_and_preserves_capital(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(
+    cli.account_create(_ns(
         db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
     ))
     # Allocate all 100 shares to YOLO (cost follows shares) so YOLO holds the asset
-    cli.virtual_allocate(_ns(
+    cli.account_allocate(_ns(
         db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
     ))
 
     total_before = _account_value(DatabaseHandler(db_file), "1111") + _account_value(DatabaseHandler(db_file), "YOLO")
     assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
 
-    rc = cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    rc = cli.account_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
     assert rc == 0
 
     db = DatabaseHandler(db_file)
@@ -483,10 +483,10 @@ def test_virtual_close_empties_virtual_and_preserves_capital(tmp_path):
 
 def test_virtual_close_preserves_account_row(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(
+    cli.account_create(_ns(
         db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
     ))
-    cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    cli.account_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
     db = DatabaseHandler(db_file)
     db.connect()
     # Row preserved (still flagged virtual) so historical cohort data remains queryable
@@ -497,14 +497,14 @@ def test_virtual_close_preserves_account_row(tmp_path):
 
 def test_virtual_close_rejects_non_virtual(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    rc = cli.virtual_close(_ns(db_file, name="1111", to=None, date="2020-09-01"))
+    rc = cli.account_close(_ns(db_file, name="1111", to=None, date="2020-09-01"))
     assert rc == 1
 
 
 def test_virtual_close_nothing_to_close(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    rc = cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
     assert rc == 0  # empty virtual — no-op success
 
 
@@ -532,9 +532,9 @@ _SELL = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belo
 
 def test_sell_routed_when_parent_holds_none(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     # Allocate ALL 100 shares to YOLO -> parent holds 0
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
     assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(0, abs=1e-6)
 
     csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
@@ -547,9 +547,9 @@ def test_sell_routed_when_parent_holds_none(tmp_path):
 
 def test_sell_split_when_parent_holds_partial(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     # Parent keeps 60, YOLO gets 40
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
     assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(60, abs=1e-6)
 
     # Sell 80 > parent's 60 -> split: parent sells 60, YOLO sells 20
@@ -562,8 +562,8 @@ def test_sell_split_when_parent_holds_partial(tmp_path):
 
 def test_sell_left_alone_when_parent_holds_enough(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
     # Parent holds 60 >= sell of 30 -> left on parent
     csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
     routed = _import_more(db_file, csv, tmp_path)
@@ -584,8 +584,8 @@ def test_sell_routing_noop_without_virtuals(tmp_path):
 def test_sell_routing_e2e_via_import_command(tmp_path):
     """Full import_data path triggers routing automatically."""
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
 
     sell_csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
     sell_file = _write_csv(tmp_path, "sell.csv", sell_csv)
@@ -602,8 +602,8 @@ _DIV = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belop
 
 def test_dividend_routed_when_parent_holds_none(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
 
     parent_before = _account_value(DatabaseHandler(db_file), "1111")
     yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
@@ -618,9 +618,9 @@ def test_dividend_routed_when_parent_holds_none(tmp_path):
 
 def test_dividend_split_proportionally_when_both_hold(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     # Parent 60, YOLO 40
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
 
     parent_before = _account_value(DatabaseHandler(db_file), "1111")
     yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
@@ -645,8 +645,8 @@ def test_dividend_left_alone_when_only_parent_holds(tmp_path):
 
 def test_dividend_routing_e2e_via_import_command(tmp_path):
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
     yolo_before = _account_value(DatabaseHandler(db_file), "YOLO")
 
     div_csv = _DIV + "2020-06-01;1111;Utdelning;Asset A;100;2;200;0;SEK;ASSETA;-"
@@ -674,8 +674,8 @@ def _query_view(db_file, view, where=None, params=()):
 def _view_setup(tmp_path):
     """Parent 1111 + virtual YOLO holding 40 of 100 Asset A shares."""
     db_file = _base_parent_db(tmp_path)
-    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"))
-    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"))
+    cli.account_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
     return db_file
 
 
