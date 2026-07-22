@@ -87,6 +87,9 @@ class DatabaseHandler:
         cursor.execute("PRAGMA foreign_keys = ON;")
 
         # transactions contains all raw transactions
+        # origin: 'avanza' (from CSV import) or 'virtual' (synthetic, created by
+        # virtual portfolio operations). Lets the import pipeline and reset logic
+        # distinguish real from synthetic transactions.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions(
                 date DATE NOT NULL, 
@@ -99,7 +102,8 @@ class DatabaseHandler:
                 courtage REAL NOT NULL,
                 currency TEXT NOT NULL,
                 isin TEXT NOT NULL,
-                processed INT DEFAULT 0
+                processed INT DEFAULT 0,
+                origin TEXT DEFAULT 'avanza'
                 )""")
 
         # cohort_data contains the capital, deposits and withdrawals per account per month
@@ -163,10 +167,14 @@ class DatabaseHandler:
                 );""")
         
         # accounts contains account-level configuration like nicknames
+        # is_virtual: 1 for virtual portfolios, 0 for physical Avanza accounts.
+        # parent_account: links a virtual account to its physical source.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS accounts(
                 account_id TEXT PRIMARY KEY,
-                nickname TEXT
+                nickname TEXT,
+                is_virtual INTEGER DEFAULT 0,
+                parent_account TEXT
                 );""")
 
         # metadata contains system state information
@@ -249,6 +257,22 @@ class DatabaseHandler:
         # Migrate: add transfer_net column if missing (existing databases)
         try:
             cursor.execute("ALTER TABLE cohort_data ADD COLUMN transfer_net REAL DEFAULT 0")
+        except Exception:
+            pass  # Column already exists
+
+        # Migrate: add origin column to transactions if missing (existing databases)
+        try:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN origin TEXT DEFAULT 'avanza'")
+        except Exception:
+            pass  # Column already exists
+
+        # Migrate: add is_virtual and parent_account to accounts if missing
+        try:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN is_virtual INTEGER DEFAULT 0")
+        except Exception:
+            pass  # Column already exists
+        try:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN parent_account TEXT")
         except Exception:
             pass  # Column already exists
 
@@ -495,8 +519,12 @@ class DatabaseHandler:
             raise Exception("Database connection not established.")
         
         cursor = self.conn.cursor()
+        # Use ON CONFLICT DO UPDATE (not INSERT OR REPLACE) so that existing
+        # is_virtual / parent_account values on the row are preserved instead of
+        # being wiped by a delete-and-reinsert.
         cursor.execute(
-            "INSERT OR REPLACE INTO accounts (account_id, nickname) VALUES (?, ?)",
+            "INSERT INTO accounts (account_id, nickname) VALUES (?, ?) "
+            "ON CONFLICT(account_id) DO UPDATE SET nickname = excluded.nickname",
             (account_id, nickname)
         )
         self.conn.commit()
@@ -533,9 +561,21 @@ class DatabaseHandler:
             raise Exception("Database connection not established.")
         
         cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
+        # Only null out the nickname; keep the row so virtual-account config
+        # (is_virtual / parent_account) is preserved. Empty non-virtual rows are
+        # pruned afterwards to match the old "delete the row" behaviour.
+        cursor.execute(
+            "UPDATE accounts SET nickname = NULL WHERE account_id = ? AND nickname IS NOT NULL",
+            (account_id,)
+        )
+        removed = cursor.rowcount > 0
+        cursor.execute(
+            "DELETE FROM accounts WHERE account_id = ? AND nickname IS NULL "
+            "AND COALESCE(is_virtual, 0) = 0 AND parent_account IS NULL",
+            (account_id,)
+        )
         self.conn.commit()
-        return cursor.rowcount > 0
+        return removed
 
     def get_all_account_nicknames(self) -> dict:
         """
@@ -550,6 +590,38 @@ class DatabaseHandler:
         cursor = self.conn.cursor()
         cursor.execute("SELECT account_id, nickname FROM accounts WHERE nickname IS NOT NULL")
         return dict(cursor.fetchall())
+
+    # ---- Virtual account helpers (issue #74) ----
+
+    def get_virtual_map(self) -> dict:
+        """
+        Return a mapping of virtual account_id -> parent_account for all
+        virtual accounts (is_virtual = 1). Used by the import dedup logic and
+        the hierarchical account display.
+        """
+        if not self.conn:
+            raise Exception("Database connection not established.")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT account_id, parent_account FROM accounts WHERE COALESCE(is_virtual, 0) = 1")
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def is_virtual_account(self, account_id: str) -> bool:
+        """Return True if the given account is a virtual portfolio."""
+        if not self.conn:
+            raise Exception("Database connection not established.")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT is_virtual FROM accounts WHERE account_id = ?", (account_id,))
+        row = cursor.fetchone()
+        return bool(row and row[0])
+
+    def get_account_parent(self, account_id: str):
+        """Return the parent_account for an account, or None."""
+        if not self.conn:
+            raise Exception("Database connection not established.")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT parent_account FROM accounts WHERE account_id = ?", (account_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def get_date_range(self) -> tuple:
         """

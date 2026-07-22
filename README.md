@@ -355,13 +355,14 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 | `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
+| `python scripts/cli.py virtual SUBCOMMAND` | Manage virtual portfolios — sub-portfolios within a physical account (see below) |
 
 ### Global Options
 - `--database PATH` (default: `data/asset_data.db`)
 - `--special-cases PATH` (default: `data/special_cases.json`)
 
 ### Calculation & Output Options
-- `--account ACCOUNTS`: Limit to specific accounts (e.g. `12345,67890`, `default`, or `all`)
+- `--account ACCOUNTS`: Limit to specific accounts (e.g. `12345,67890`, `default`, or `all`). Omitting the flag (default) shows **physical accounts only** (excludes virtual portfolios); pass `all` to include virtual portfolios in aggregates.
 - `--update-prices {auto,always,never}` (stats only): Controls when to fetch latest stock/fund prices from Avanza API
 - `--update-all` (stats only): Update prices for all assets in the database, held or not
 - `--as-of DATE`: View snapshot/stats as of a historical date (`YYYY-MM-DD`)
@@ -396,6 +397,43 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 - `default-accounts ACCOUNTS`: Set default accounts (comma-separated list of IDs, or `all`)
 - `default-stats-period {month,year}`: Set default period for performance reports
 - `account-nickname [ACCOUNT] [NICKNAME]`: Set or list nicknames (`--list` to show all, `--remove ACCOUNT` to delete)
+
+## Virtual Portfolios
+
+Virtual portfolios let you track sub-strategies (e.g. "YOLO bets", "long-term holds") *within* a single physical Avanza account. A virtual portfolio is just another account in the database (`is_virtual = 1`, linked to a parent). Because shares are **reassigned** (not copied) to the virtual account, every share and every SEK lives on exactly one account at a time — aggregates do not double count.
+
+### Commands
+
+```bash
+# Create a virtual portfolio under a physical parent (optionally fund it)
+python cli.py virtual create --name "YOLO" --parent 1234567 [--starting-cash 5000 --starting-cash-date 2026-07-19]
+
+# Allocate an imported transaction (full, or partial via --shares)
+python cli.py virtual allocate --tx-date 2026-07-19 --tx-asset "Some Meme Stock" --to "YOLO" [--shares 50]
+
+# Move cash between accounts
+python cli.py virtual transfer-cash --amount 10000 --from 1234567 --to "YOLO" --date 2026-07-19
+
+# Move an asset position between accounts
+python cli.py virtual transfer --asset "Tesla" --shares 50 --from "YOLO" --to 1234567 --date 2026-09-01
+```
+
+### How it works
+
+- **`allocate`** moves a transaction (or splits it) onto the virtual account. Moving a buy automatically transfers the buy's cost from the parent so the virtual can fund it. Partial splits proportionally divide `total` and `courtage`.
+- **`transfer`** (asset move) is represented internally as a sell on the source → cash transfer → rebuy on the destination (all tagged as synthetic). This composes the existing transaction handlers and is correct on every statistics path. The **source realizes its gain** up to the transfer and the **destination gets a fresh cost basis** at the transfer price — an honest "this position left / entered the strategy" bookkeeping.
+- After every virtual mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
+
+### Viewing virtual portfolios
+
+- `accounts` shows a hierarchical tree: each physical account lists its combined value (self + its virtual children), with the children indented and marked `[V]`. The `TOTAL` row sums physical rows only (children are a breakdown, so nothing is double counted).
+- `stats` / `portfolio` default to **physical accounts only**. Pass `--account all` to include virtual portfolios, or `--account "YOLO"` to view a single virtual portfolio.
+
+### Phase-1 limitations
+
+- **Dividends and sells** that arrive on the physical account after the underlying shares were allocated are *not* auto-routed to the virtual — run `virtual allocate` on them too. If a sell is left on the physical account without matching shares, reprocessing will surface a clear error.
+- Funding a virtual requires the source account to hold enough capital at the transfer date.
+- `virtual close` (bulk transfer-back to parent) and `virtual list` are planned (Phase 2).
 
 ## Special Cases
 

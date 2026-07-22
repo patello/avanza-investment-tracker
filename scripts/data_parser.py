@@ -214,20 +214,33 @@ class DataParser:
         self.db.connect()
         cur = self.db.conn.cursor()
 
-        # 1. Fetch existing transactions in the date range
+        # Virtual accounts map onto their parent for dedup matching, so that a
+        # transaction allocated to a virtual portfolio is still recognised as
+        # "already imported" when the source CSV is re-imported on the parent
+        # account. (See issue #74 prestudy #2 — parent-remap, not account-agnostic.)
+        virtual_map = self.db.get_virtual_map()
+
+        # 1. Fetch existing REAL transactions in the date range. Synthetic rows
+        #    (origin = 'virtual') are excluded: they are never re-imported from
+        #    CSV and must not shadow or be shadowed by real re-imports.
         existing_transactions = cur.execute(
-            "SELECT date, account, transaction_type, asset_name, amount, price, isin FROM transactions WHERE date >= ? and date <= ?",
+            "SELECT date, account, transaction_type, asset_name, amount, price, isin "
+            "FROM transactions "
+            "WHERE date >= ? AND date <= ? AND (origin = 'avanza' OR origin IS NULL)",
             (min_date, max_date)
         ).fetchall()
 
-        # 2. Group existing transactions in DB
+        # 2. Group existing transactions in DB, remapping each virtual account
+        #    back to its parent so allocated rows collapse onto the parent key
+        #    that the proposed CSV groups use.
         existing_groups = {}
         for tx in existing_transactions:
             # tx: (date, account, transaction_type, asset_name, amount, price, isin)
-            # key: (date, account, transaction_type, isin_or_asset_name)
+            # key: (date, account_for_key, transaction_type, isin_or_asset_name)
             isin_val = tx[6]
             asset_name = tx[3]
-            key = (tx[0], tx[1], tx[2], isin_val if (isin_val and isin_val.strip()) else asset_name)
+            account_for_key = virtual_map.get(tx[1], tx[1])
+            key = (tx[0], account_for_key, tx[2], isin_val if (isin_val and isin_val.strip()) else asset_name)
             if key not in existing_groups:
                 existing_groups[key] = []
             existing_groups[key].append(tx)
@@ -1001,7 +1014,12 @@ class DataParser:
                 updated_row_data = tuple(final_row_data)
                 
                 if updated_row_data != row_data:
-                    rowid = row[11]
+                    # row layout: (date..isin[0-9], processed[10], origin[11], rowid[12]).
+                    # Use row[-1] for rowid and preserve origin so the in-memory row
+                    # stays aligned with the actual column order after the origin
+                    # column was added (issue #74).
+                    rowid = row[-1]
+                    origin_val = row[-2]
                     logging.info(f"Re-applying special case change for transaction on {row[0]}: {row_data} -> {updated_row_data}")
                     self.data_cur.execute("""
                         UPDATE transactions
@@ -1009,7 +1027,7 @@ class DataParser:
                             amount = ?, price = ?, total = ?, courtage = ?, currency = ?, isin = ?
                         WHERE rowid = ?
                     """, updated_row_data + (rowid,))
-                    row = updated_row_data + (0, rowid)
+                    row = updated_row_data + (0, origin_val, rowid)
 
             month = self.allocate_to_month(row[0])
             if row[2] == "Insättning" or row[2] == "Autogiroinsättning":

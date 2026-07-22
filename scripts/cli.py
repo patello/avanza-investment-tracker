@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, date
 
 import os
 from database_handler import DatabaseHandler
-from data_parser import DataParser, SpecialCases
+from data_parser import DataParser, SpecialCases, AssetDeficit
 from calculate_stats import StatCalculator
 
 
@@ -196,8 +196,40 @@ def parse_date_bound(date_str, is_start_bound=False):
     raise ValueError(f"Invalid date format: '{date_str}'. Supported formats: YYYY, YYYY-MM, YYYY-MM-DD")
 
 
+def get_physical_accounts(db):
+    """
+    Return the list of physical (non-virtual) account IDs that have transactions.
+
+    Returns None when no virtual accounts exist, so the caller's "no filter / all
+    accounts" path is taken unchanged — preserving current behaviour for users
+    who have not created any virtual portfolios. When virtuals do exist, returns
+    the explicit physical-account list so aggregates exclude them by default.
+    """
+    virtual_map = db.get_virtual_map()
+    if not virtual_map:
+        return None
+    cur = db.get_cursor()
+    cur.execute("SELECT DISTINCT account FROM transactions")
+    accounts = [r[0] for r in cur.fetchall()]
+    physical = [a for a in accounts if a not in virtual_map]
+    return physical or None
+
+
 def resolve_accounts(db, account_arg):
-    """Parse account argument and resolve display names/nicknames to account IDs."""
+    """Parse account argument and resolve display names/nicknames to account IDs.
+
+    Returns a list of account IDs, or None to signal "no filter" (all accounts):
+      * account_arg is None (unspecified) -> physical accounts only (excludes
+        virtual portfolios). If no virtuals exist this returns None == all, so
+        current behaviour is preserved.
+      * account_arg == 'all'               -> None (truly all accounts incl. virtual).
+      * account_arg == 'default'           -> the configured default set.
+      * otherwise                          -> explicit comma-separated list, with
+        nicknames resolved to IDs.
+    """
+    if account_arg is None:
+        return get_physical_accounts(db)
+
     account_arg = account_arg.strip()
     if account_arg.lower() == 'all':
         return None
@@ -222,6 +254,16 @@ def resolve_accounts(db, account_arg):
         else:
             resolved.append(acc)
     return resolved
+
+
+def resolve_single_account(db, identifier):
+    """Resolve a single account identifier (id or nickname) to its account ID."""
+    if identifier is None:
+        return None
+    identifier = identifier.strip()
+    nicknames = db.get_all_account_nicknames()
+    reverse = {v.lower().strip(): k for k, v in nicknames.items()}
+    return reverse.get(identifier.lower().strip(), identifier)
 
 
 def check_price_staleness(asset_name, price_date_str, target_date, warnings_list, threshold_days=30):
@@ -1277,14 +1319,22 @@ def accounts_summary(args):
     # Display account summary
     try:
         stat_calc = StatCalculator(db)
+        # When unspecified or 'all', show the full hierarchical tree (physical
+        # accounts with their virtual children). An explicit list is shown flat.
+        show_tree = args.account is None or (
+            isinstance(args.account, str) and args.account.strip().lower() == 'all'
+        )
         if getattr(args, 'format', 'table') == 'json':
-            summaries = stat_calc.get_account_summaries(accounts)
+            summaries = stat_calc.get_account_summaries(None if show_tree else accounts)
             nicknames = db.get_all_account_nicknames()
+            virtual_map = db.get_virtual_map()
             json_data = []
             for account, cash, asset_value, total in summaries:
                 json_data.append({
                     'account': account,
                     'display_name': nicknames.get(account, account),
+                    'is_virtual': account in virtual_map,
+                    'parent_account': virtual_map.get(account),
                     'cash': cash,
                     'assets': asset_value,
                     'total': total
@@ -1292,7 +1342,10 @@ def accounts_summary(args):
             import json
             print(json.dumps(json_data, indent=2))
         else:
-            stat_calc.print_account_summary(accounts=accounts)
+            if show_tree:
+                print_account_tree(stat_calc, db)
+            else:
+                stat_calc.print_account_summary(accounts=accounts)
         return 0
         
     except Exception as e:
@@ -1407,6 +1460,354 @@ def export_transactions(args):
     return 0
 
 
+def _parse_exact_date(date_str):
+    """Parse a strict YYYY-MM-DD date string into a date object."""
+    return datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+
+
+def reprocess_after_virtual_change(db, special_cases_path):
+    """Reset cohort tables and reprocess all transactions after a virtual
+    portfolio mutation. Returns 0 on success, 1 if reprocessing fails (e.g. an
+    AssetDeficit from a sell/dividend allocated without matching shares)."""
+    special_cases = SpecialCases(special_cases_path) if special_cases_path else None
+    parser = DataParser(db, special_cases)
+    db.connect()
+    parser.reset_for_reprocessing()
+    try:
+        parser.process_transactions()
+    except AssetDeficit:
+        logging.error("Reprocessing failed: one or more transactions could not be processed.")
+        logging.error("This usually means a sell/dividend was allocated to a virtual account")
+        logging.error("without the corresponding shares/capital being there. Inspect the logs above.")
+        return 1
+    now = datetime.now().isoformat()
+    db.set_metadata('last_processed', now)
+    db.set_metadata('last_stats_calculation', '')
+    return 0
+
+
+def _insert_internal_transfer_pair(db, from_acc, to_acc, amount, tx_date):
+    """Insert a paired 'Intern överföring' (origin='virtual') moving `amount`
+    from `from_acc` to `to_acc` on `tx_date`. The pair is consumed by
+    handle_internal_transfer on reprocessing. Returns True on success.
+    """
+    cur = db.get_cursor()
+    cur.execute("SELECT COALESCE(SUM(total), 0) FROM transactions WHERE account = ?", (from_acc,))
+    bal = cur.fetchone()[0]
+    if bal + 1e-4 < amount:
+        logging.error(f"Source account '{from_acc}' has insufficient capital ({bal:.0f}) for transfer of {amount:.0f} SEK.")
+        return False
+    # Negative total on source (OUT), positive on destination (IN).
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Intern överföring', ?, 0, 0, ?, 0, 'SEK', '-', 'virtual')",
+        (tx_date, from_acc, f"Transfer to {to_acc}", -amount)
+    )
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Intern överföring', ?, 0, 0, ?, 0, 'SEK', '-', 'virtual')",
+        (tx_date, to_acc, f"Transfer from {from_acc}", amount)
+    )
+    db.commit()
+    return True
+
+
+def virtual_create(args):
+    """Create a virtual portfolio under a parent (physical) account."""
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+    name = args.name.strip()
+    parent = resolve_single_account(db, args.parent)
+
+    if db.is_virtual_account(parent):
+        logging.error(f"Parent account '{parent}' is itself a virtual portfolio. Nesting is not allowed.")
+        return 1
+    cur.execute("SELECT COUNT(*) FROM transactions WHERE account = ?", (parent,))
+    if cur.fetchone()[0] == 0:
+        logging.error(f"Parent account '{parent}' has no transactions. Use a real Avanza account.")
+        return 1
+    cur.execute("SELECT account_id FROM accounts WHERE account_id = ?", (name,))
+    if cur.fetchone():
+        logging.error(f"An account named '{name}' already exists.")
+        return 1
+    cur.execute("SELECT COUNT(*) FROM transactions WHERE account = ?", (name,))
+    if cur.fetchone()[0] > 0:
+        logging.error(f"Name '{name}' collides with an existing transaction account.")
+        return 1
+
+    cur.execute(
+        "INSERT INTO accounts (account_id, nickname, is_virtual, parent_account) VALUES (?, ?, 1, ?)",
+        (name, name, parent)
+    )
+    db.commit()
+    logging.info(f"Created virtual portfolio '{name}' under parent '{parent}'.")
+
+    if args.starting_cash and args.starting_cash > 0:
+        tx_date = _parse_exact_date(args.starting_cash_date) if args.starting_cash_date else date.today()
+        if _insert_internal_transfer_pair(db, parent, name, args.starting_cash, tx_date):
+            logging.info(f"Funded '{name}' with {args.starting_cash:.0f} SEK from '{parent}'.")
+            if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+                return 1
+        else:
+            logging.warning("Virtual portfolio created but not funded (insufficient capital on parent).")
+            logging.warning("Fund it later with `virtual transfer-cash`.")
+    return 0
+
+
+def virtual_allocate(args):
+    """Allocate a transaction (full or partial split) to a virtual portfolio."""
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+    to_account = resolve_single_account(db, args.to)
+    if not db.is_virtual_account(to_account):
+        logging.error(f"Target '{args.to}' is not a virtual portfolio. Create it first with `virtual create`.")
+        return 1
+    parent = db.get_account_parent(to_account)
+    source = resolve_single_account(db, args.from_account) if args.from_account else parent
+    if not source:
+        logging.error("No source account resolved (virtual has no parent and no --from given).")
+        return 1
+
+    tx_date = _parse_exact_date(args.tx_date)
+    asset = args.tx_asset.strip()
+
+    cur.execute(
+        "SELECT rowid, date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin "
+        "FROM transactions WHERE date = ? AND account = ? AND asset_name = ? AND origin = 'avanza' "
+        "ORDER BY rowid",
+        (tx_date, source, asset)
+    )
+    matches = cur.fetchall()
+    if not matches:
+        logging.error(f"No transactions found on '{source}' for '{asset}' on {tx_date}.")
+        return 1
+
+    allocatable = ('Köp', 'Sälj', 'Utdelning', 'Räntor', 'Ränta', 'Inlåningsränta', 'Utlåningsränta',
+                   'Tillgångsinsättning', 'Värdepappersuttag', 'Intern överföring', 'Insättning', 'Autogiroinsättning', 'Uttag')
+
+    # Capital that must follow the shares: a buy (Köp) consumes capital, so when
+    # it is moved to the virtual the virtual must be funded with the buy's cost,
+    # otherwise reprocessing fails (the buy is unfundable on the virtual). We move
+    # the cost from the source account via an internal transfer dated the day
+    # before the buy so it processes first. (The issue's "allocation = reassign
+    # only" model breaks reprocessing for buys; this corrects it.)
+    buy_cost_to_move = 0.0
+
+    if args.shares is None:
+        count = 0
+        for m in matches:
+            if m[3] not in allocatable:
+                logging.warning(f"Skipping {m[3]} (rowid {m[0]}) — not allocatable.")
+                continue
+            cur.execute("UPDATE transactions SET account = ? WHERE rowid = ?", (to_account, m[0]))
+            if m[3] == 'Köp':
+                buy_cost_to_move += abs(m[7])
+            count += 1
+        logging.info(f"Allocated {count} transaction(s) from '{source}' to '{to_account}'.")
+    else:
+        shares = args.shares
+        split_count = 0
+        for m in matches:
+            if m[3] not in ('Köp', 'Sälj'):
+                logging.warning(f"Partial --shares skipped for {m[3]} (rowid {m[0]}); only Köp/Sälj supported.")
+                continue
+            rowid, d, acc, ttype, aname, amount, price, total, courtage, currency, isin = m
+            orig_shares = abs(amount)
+            if shares > orig_shares + 1e-6:
+                logging.error(f"Requested {shares} shares but rowid {rowid} only has {orig_shares}.")
+                return 1
+            if shares < orig_shares - 1e-6:
+                remaining = orig_shares - shares
+                frac = shares / orig_shares
+                moved_total = total * frac
+                moved_courtage = courtage * frac
+                sign = 1 if amount >= 0 else -1
+                cur.execute(
+                    "UPDATE transactions SET amount = ?, total = ?, courtage = ? WHERE rowid = ?",
+                    (sign * remaining, total - moved_total, courtage - moved_courtage, rowid)
+                )
+                cur.execute(
+                    "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'avanza')",
+                    (d, to_account, ttype, aname, sign * shares, price, moved_total, moved_courtage, currency, isin)
+                )
+                if ttype == 'Köp':
+                    buy_cost_to_move += abs(moved_total)
+                split_count += 1
+            else:
+                cur.execute("UPDATE transactions SET account = ? WHERE rowid = ?", (to_account, rowid))
+                if ttype == 'Köp':
+                    buy_cost_to_move += abs(total)
+                split_count += 1
+        logging.info(f"Split/allocated {split_count} transaction(s): {shares} shares to '{to_account}'.")
+
+    if buy_cost_to_move > 1e-4:
+        fund_date = tx_date - timedelta(days=1)
+        if not _insert_internal_transfer_pair(db, source, to_account, buy_cost_to_move, fund_date):
+            db.conn.rollback()
+            logging.error("Could not move capital to fund the allocated buy(s); rolled back.")
+            return 1
+        logging.info(f"Moved {buy_cost_to_move:.0f} SEK from '{source}' to '{to_account}' to fund the allocated buy(s).")
+
+    db.commit()
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        return 1
+    return 0
+
+
+def virtual_transfer_cash(args):
+    """Move cash between accounts via an internal transfer pair."""
+    db = get_db(args)
+    db.connect()
+    from_acc = resolve_single_account(db, args.from_account)
+    to_acc = resolve_single_account(db, args.to)
+    tx_date = _parse_exact_date(args.date)
+    amount = args.amount
+    if amount <= 0:
+        logging.error("Amount must be positive.")
+        return 1
+    if not _insert_internal_transfer_pair(db, from_acc, to_acc, amount, tx_date):
+        return 1
+    logging.info(f"Transferred {amount:.0f} SEK from '{from_acc}' to '{to_acc}' on {tx_date}.")
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        return 1
+    return 0
+
+
+def virtual_transfer(args):
+    """Move an asset position between accounts.
+
+    Implemented as a decomposition (sell → cash transfer → rebuy), all rows
+    tagged origin='virtual'. This composes the existing proven handlers, is
+    correct on every statistics path, and gives the destination a fresh cost
+    basis at the transfer price (the source realizes its gain up to the
+    transfer — an honest 'this position left the strategy' bookkeeping).
+    """
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+    from_acc = resolve_single_account(db, args.from_account)
+    to_acc = resolve_single_account(db, args.to)
+    asset = args.asset.strip()
+    shares = args.shares
+    tx_date = _parse_exact_date(args.date)
+    if shares <= 0:
+        logging.error("Shares must be positive.")
+        return 1
+
+    cur.execute("SELECT asset_id FROM assets WHERE asset = ?", (asset,))
+    row = cur.fetchone()
+    if not row:
+        logging.error(f"Unknown asset '{asset}'.")
+        return 1
+    asset_id = row[0]
+    cur.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM cohort_assets WHERE asset_id = ? AND account = ? AND amount > 0",
+        (asset_id, from_acc)
+    )
+    held = cur.fetchone()[0]
+    if held + 1e-6 < shares:
+        logging.error(f"Source '{from_acc}' holds only {held:.4f} shares of '{asset}'; cannot transfer {shares}.")
+        return 1
+
+    price, _, _, _ = db.get_price(asset_id, tx_date)
+    if not price or price <= 0:
+        logging.error(f"No price available for '{asset}' on {tx_date}; cannot value the transfer.")
+        return 1
+    proceeds = shares * price
+
+    cur.execute(
+        "SELECT currency, isin FROM transactions WHERE asset_name = ? AND currency IS NOT NULL AND currency != '' ORDER BY rowid LIMIT 1",
+        (asset,)
+    )
+    meta = cur.fetchone()
+    currency = meta[0] if meta and meta[0] else 'SEK'
+    isin = meta[1] if meta and meta[1] else '-'
+
+    # 1. Sälj on source (amount negative, total positive proceeds)
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Sälj', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
+        (tx_date, from_acc, asset, -shares, price, proceeds, currency, isin)
+    )
+    # 2. Cash transfer pair (source → destination)
+    if not _insert_internal_transfer_pair(db, from_acc, to_acc, proceeds, tx_date):
+        db.conn.rollback()
+        logging.error("Asset sale rolled back — cash transfer failed (insufficient capital on source).")
+        return 1
+    # 3. Köp on destination (amount positive, total negative cost)
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Köp', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
+        (tx_date, to_acc, asset, shares, price, -proceeds, currency, isin)
+    )
+    db.commit()
+    logging.info(f"Transferred {shares} shares of '{asset}' from '{from_acc}' to '{to_acc}' @ {price:.2f} (value {proceeds:.0f} SEK).")
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        return 1
+    return 0
+
+
+def print_account_tree(stat_calc, db):
+    """Print account summaries hierarchically: each physical account shows its
+    combined (self + virtual children) value, with the children listed indented
+    beneath. The TOTAL sums physical rows only (children are a breakdown, so no
+    double counting)."""
+    summaries = stat_calc.get_account_summaries(None)
+    if not summaries:
+        print("No account data found")
+        return
+    summary_map = {s[0]: s for s in summaries}
+    virtual_map = db.get_virtual_map()
+    nicknames = db.get_all_account_nicknames()
+
+    children_of = {}
+    for v_id, parent in virtual_map.items():
+        children_of.setdefault(parent, []).append(v_id)
+
+    def display(account):
+        nick = nicknames.get(account)
+        return nick if nick else account
+
+    physical = [a for a in summary_map if a not in virtual_map]
+    physical.sort(key=lambda a: summary_map[a][3], reverse=True)
+
+    total_cash = total_assets = total_total = 0.0
+    print(f"{'Account':<30} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12}")
+    print("-" * 70)
+    for phys in physical:
+        ps = summary_map[phys]
+        kids = sorted(children_of.get(phys, []), key=lambda v: summary_map.get(v, (0, 0, 0, 0))[3], reverse=True)
+        kids = [k for k in kids if k in summary_map]
+        comb_cash = ps[1] + sum(summary_map[k][1] for k in kids)
+        comb_assets = ps[2] + sum(summary_map[k][2] for k in kids)
+        comb_total = ps[3] + sum(summary_map[k][3] for k in kids)
+        label = display(phys) + (" [incl. virtuals]" if kids else "")
+        print(f"{label:<30} {comb_cash:>12.0f} {comb_assets:>12.0f} {comb_total:>12.0f}")
+        for k in kids:
+            ks = summary_map[k]
+            klabel = "  -- " + display(k) + " [V]"
+            print(f"{klabel:<30} {ks[1]:>12.0f} {ks[2]:>12.0f} {ks[3]:>12.0f}")
+        total_cash += comb_cash
+        total_assets += comb_assets
+        total_total += comb_total
+
+    # Orphaned virtuals (parent not present in summaries)
+    for v_id, parent in virtual_map.items():
+        if v_id in summary_map and parent not in summary_map:
+            vs = summary_map[v_id]
+            vlabel = "  -- " + display(v_id) + " [V]"
+            print(f"{vlabel:<30} {vs[1]:>12.0f} {vs[2]:>12.0f} {vs[3]:>12.0f}")
+            total_cash += vs[1]
+            total_assets += vs[2]
+            total_total += vs[3]
+
+    print("-" * 70)
+    print(f"{'TOTAL':<30} {total_cash:>12.0f} {total_assets:>12.0f} {total_total:>12.0f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Avanza investment tracker CLI",
@@ -1474,8 +1875,8 @@ Examples:
     )
     stats_parser.add_argument(
         '--account',
-        default='all',
-        help='Accounts to include: "default", "all", or comma-separated list of accounts'
+        default=None,
+        help='Accounts to include: omit for physical-only (default), "all" includes virtual portfolios, "default", or comma-separated list'
     )
     stats_parser.add_argument(
         '--apy-mode',
@@ -1580,8 +1981,8 @@ Examples:
     accounts_parser = subparsers.add_parser('accounts', help='Show account summaries with asset values and cash')
     accounts_parser.add_argument(
         '--account',
-        default='all',
-        help='Accounts to include: "default", "all", or comma-separated list of accounts'
+        default=None,
+        help='Accounts to include: omit for the full tree (default), "all", "default", or comma-separated list'
     )
     accounts_parser.add_argument(
         '--update-prices',
@@ -1637,8 +2038,8 @@ Examples:
     )
     portfolio_parser.add_argument(
         '--account',
-        default='all',
-        help='Accounts to include: "default", "all", or comma-separated list of accounts'
+        default=None,
+        help='Accounts to include: omit for physical-only (default), "all" includes virtual portfolios, "default", or comma-separated list'
     )
     portfolio_parser.add_argument(
         '--apy-mode',
@@ -1685,15 +2086,51 @@ Examples:
     )
     export_parser.add_argument(
         '--account',
-        default='all',
-        help='Account ID or display name to filter (default: all)'
+        default=None,
+        help='Account ID or display name to filter (omit for all including virtual)'
     )
     export_parser.set_defaults(func=export_transactions)
-    
+
+    # Virtual portfolios command group (issue #74)
+    virtual_parser = subparsers.add_parser(
+        'virtual', help='Manage virtual portfolios (sub-portfolios within a physical account)'
+    )
+    virtual_sub = virtual_parser.add_subparsers(dest='virtual_command')
+
+    vp_create = virtual_sub.add_parser('create', help='Create a virtual portfolio under a parent account')
+    vp_create.add_argument('--name', required=True, help='Name for the virtual portfolio (used as its account ID)')
+    vp_create.add_argument('--parent', required=True, help='Parent (physical) account ID or nickname')
+    vp_create.add_argument('--starting-cash', type=float, default=None, help='Optional starting cash to transfer from parent')
+    vp_create.add_argument('--starting-cash-date', default=None, help='Date for the starting cash transfer (YYYY-MM-DD; default today)')
+    vp_create.set_defaults(func=virtual_create)
+
+    vp_alloc = virtual_sub.add_parser('allocate', help='Allocate a transaction (full or partial split) to a virtual portfolio')
+    vp_alloc.add_argument('--tx-date', required=True, help='Transaction date (YYYY-MM-DD)')
+    vp_alloc.add_argument('--tx-asset', required=True, help='Asset name of the transaction')
+    vp_alloc.add_argument('--to', required=True, help='Virtual portfolio to allocate to')
+    vp_alloc.add_argument('--from', dest='from_account', default=None, help="Source account (default: virtual portfolio's parent)")
+    vp_alloc.add_argument('--shares', type=float, default=None, help='Shares to allocate (partial split); omit for full allocation')
+    vp_alloc.set_defaults(func=virtual_allocate)
+
+    vp_cash = virtual_sub.add_parser('transfer-cash', help='Move cash between accounts')
+    vp_cash.add_argument('--amount', type=float, required=True, help='Amount (SEK) to transfer')
+    vp_cash.add_argument('--from', dest='from_account', required=True, help='Source account')
+    vp_cash.add_argument('--to', required=True, help='Destination account')
+    vp_cash.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
+    vp_cash.set_defaults(func=virtual_transfer_cash)
+
+    vp_xfer = virtual_sub.add_parser('transfer', help='Move an asset position between accounts (sell -> cash -> rebuy)')
+    vp_xfer.add_argument('--asset', required=True, help='Asset name to transfer')
+    vp_xfer.add_argument('--shares', type=float, required=True, help='Number of shares to transfer')
+    vp_xfer.add_argument('--from', dest='from_account', required=True, help='Source account')
+    vp_xfer.add_argument('--to', required=True, help='Destination account')
+    vp_xfer.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
+    vp_xfer.set_defaults(func=virtual_transfer)
+
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
     status_parser.set_defaults(func=status)
-    
+
     # Reset command
     reset_parser = subparsers.add_parser('reset', help='Reset database state')
     reset_parser.add_argument(
@@ -1702,13 +2139,17 @@ Examples:
         help='Hard reset: delete all transactions, stats, and prices'
     )
     reset_parser.set_defaults(func=reset)
-    
+
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
         return 1
-    
+
+    if args.command == 'virtual' and not getattr(args, 'virtual_command', None):
+        virtual_parser.print_help()
+        return 1
+
     return args.func(args)
 
 
