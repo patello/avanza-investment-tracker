@@ -416,12 +416,19 @@ python cli.py virtual transfer-cash --amount 10000 --from 1234567 --to "YOLO" --
 
 # Move an asset position between accounts
 python cli.py virtual transfer --asset "Tesla" --shares 50 --from "YOLO" --to 1234567 --date 2026-09-01
+
+# List virtual portfolios with current value and APY
+python cli.py virtual list [--apy-mode twrr] [--format json]
+
+# Close a virtual: move all holdings + residual cash back to its parent
+python cli.py virtual close --name "YOLO" --date 2026-09-01
 ```
 
 ### How it works
 
 - **`allocate`** moves a transaction (or splits it) onto the virtual account. Moving a buy automatically transfers the buy's cost from the parent so the virtual can fund it. Partial splits proportionally divide `total` and `courtage`.
 - **`transfer`** (asset move) is represented internally as a sell on the source → cash transfer → rebuy on the destination (all tagged as synthetic). This composes the existing transaction handlers and is correct on every statistics path. The **source realizes its gain** up to the transfer and the **destination gets a fresh cost basis** at the transfer price — an honest "this position left / entered the strategy" bookkeeping.
+- **`close`** moves every holding (via the same decomposition) plus any residual cash back to the parent, then reprocesses. The virtual account row is **preserved** (kept `is_virtual = 1`) so its historical cohort/performance data remains queryable; it simply ends up empty.
 - After every virtual mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
 
 ### Viewing virtual portfolios
@@ -429,11 +436,11 @@ python cli.py virtual transfer --asset "Tesla" --shares 50 --from "YOLO" --to 12
 - `accounts` shows a hierarchical tree: each physical account lists its combined value (self + its virtual children), with the children indented and marked `[V]`. The `TOTAL` row sums physical rows only (children are a breakdown, so nothing is double counted).
 - `stats` / `portfolio` default to **physical accounts only**. Pass `--account all` to include virtual portfolios, or `--account "YOLO"` to view a single virtual portfolio.
 
-### Phase-1 limitations
+### Limitations
 
 - **Dividends and sells** that arrive on the physical account after the underlying shares were allocated are *not* auto-routed to the virtual — run `virtual allocate` on them too. If a sell is left on the physical account without matching shares, reprocessing will surface a clear error.
 - Funding a virtual requires the source account to hold enough capital at the transfer date.
-- `virtual close` (bulk transfer-back to parent) and `virtual list` are planned (Phase 2).
+- A post-import "allocate these new transactions?" helper and automatic routing of dividends/sells to virtuals are not yet implemented.
 
 ## Special Cases
 

@@ -407,3 +407,102 @@ def test_resolve_accounts_none_when_no_virtuals(tmp_path):
     # No virtuals -> None (all) to preserve current behaviour
     assert cli.resolve_accounts(db, None) is None
     db.disconnect()
+
+
+# ---------- virtual list ----------
+
+def test_virtual_list_empty(tmp_path, capsys):
+    db_file = _base_parent_db(tmp_path)
+    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='table'))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No virtual portfolios" in out
+
+
+def test_virtual_list_shows_portfolio_with_value(tmp_path, capsys):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(
+        db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
+    ))
+    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='table'))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "YOLO" in out
+    assert "1111" in out  # parent shown
+
+
+def test_virtual_list_json(tmp_path, capsys):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(
+        db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
+    ))
+    rc = cli.virtual_list(_ns(db_file, apy_mode='mwrr', format='json'))
+    assert rc == 0
+    import json
+    data = json.loads(capsys.readouterr().out)
+    assert len(data) == 1
+    assert data[0]["virtual"] == "YOLO"
+    assert data[0]["parent_account"] == "1111"
+    assert data[0]["is_virtual"] if "is_virtual" in data[0] else True  # is_virtual optional in json
+    assert data[0]["total"] == pytest.approx(5000, abs=1)
+
+
+# ---------- virtual close ----------
+
+def test_virtual_close_empties_virtual_and_preserves_capital(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(
+        db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
+    ))
+    # Allocate all 100 shares to YOLO (cost follows shares) so YOLO holds the asset
+    cli.virtual_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+
+    total_before = _account_value(DatabaseHandler(db_file), "1111") + _account_value(DatabaseHandler(db_file), "YOLO")
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+    rc = cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    assert rc == 0
+
+    db = DatabaseHandler(db_file)
+    # Virtual emptied of holdings
+    assert _holdings(db, "YOLO") == pytest.approx(0, abs=1e-6)
+    # Virtual has no residual cash
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("SELECT COALESCE(SUM(capital),0) FROM cohort_data WHERE account='YOLO'")
+    assert cur.fetchone()[0] == pytest.approx(0, abs=1)
+    db.disconnect()
+    # Capital conserved across the close (parent reabsorbed everything)
+    total_after = _account_value(DatabaseHandler(db_file), "1111") + _account_value(DatabaseHandler(db_file), "YOLO")
+    assert total_after == pytest.approx(total_before, abs=1)
+    # All 100 shares back on parent
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(100, abs=1e-6)
+
+
+def test_virtual_close_preserves_account_row(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(
+        db_file, name="YOLO", parent="1111", starting_cash=5000.0, starting_cash_date="2020-02-01"
+    ))
+    cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    db = DatabaseHandler(db_file)
+    db.connect()
+    # Row preserved (still flagged virtual) so historical cohort data remains queryable
+    assert db.is_virtual_account("YOLO") is True
+    assert db.get_account_parent("YOLO") == "1111"
+    db.disconnect()
+
+
+def test_virtual_close_rejects_non_virtual(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    rc = cli.virtual_close(_ns(db_file, name="1111", to=None, date="2020-09-01"))
+    assert rc == 1
+
+
+def test_virtual_close_nothing_to_close(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
+    assert rc == 0  # empty virtual — no-op success

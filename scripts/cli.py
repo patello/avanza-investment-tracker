@@ -1676,10 +1676,55 @@ def virtual_transfer_cash(args):
     return 0
 
 
+def _perform_asset_transfer(db, from_acc, to_acc, asset, shares, tx_date):
+    """Insert the Sälj -> Intern överföring -> Köp rows for an asset move
+    (all origin='virtual'). Performs lookups (price, currency, isin) internally.
+    Does NOT commit or reprocess. Returns (proceeds, price) on success or None
+    on failure (caller should rollback)."""
+    cur = db.get_cursor()
+    cur.execute("SELECT asset_id FROM assets WHERE asset = ?", (asset,))
+    row = cur.fetchone()
+    if not row:
+        logging.error(f"Unknown asset '{asset}'.")
+        return None
+    asset_id = row[0]
+
+    price, _, _, _ = db.get_price(asset_id, tx_date)
+    if not price or price <= 0:
+        logging.error(f"No price available for '{asset}' on {tx_date}; cannot value the transfer.")
+        return None
+    proceeds = shares * price
+
+    cur.execute(
+        "SELECT currency, isin FROM transactions WHERE asset_name = ? AND currency IS NOT NULL AND currency != '' ORDER BY rowid LIMIT 1",
+        (asset,)
+    )
+    meta = cur.fetchone()
+    currency = meta[0] if meta and meta[0] else 'SEK'
+    isin = meta[1] if meta and meta[1] else '-'
+
+    # 1. Sälj on source (amount negative, total positive proceeds)
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Sälj', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
+        (tx_date, from_acc, asset, -shares, price, proceeds, currency, isin)
+    )
+    # 2. Cash transfer pair (source -> destination)
+    if not _insert_internal_transfer_pair(db, from_acc, to_acc, proceeds, tx_date):
+        return None
+    # 3. Köp on destination (amount positive, total negative cost)
+    cur.execute(
+        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+        "VALUES (?, ?, 'Köp', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
+        (tx_date, to_acc, asset, shares, price, -proceeds, currency, isin)
+    )
+    return (proceeds, price)
+
+
 def virtual_transfer(args):
     """Move an asset position between accounts.
 
-    Implemented as a decomposition (sell → cash transfer → rebuy), all rows
+    Implemented as a decomposition (sell -> cash transfer -> rebuy), all rows
     tagged origin='virtual'. This composes the existing proven handlers, is
     correct on every statistics path, and gives the destination a fresh cost
     basis at the transfer price (the source realizes its gain up to the
@@ -1712,39 +1757,126 @@ def virtual_transfer(args):
         logging.error(f"Source '{from_acc}' holds only {held:.4f} shares of '{asset}'; cannot transfer {shares}.")
         return 1
 
-    price, _, _, _ = db.get_price(asset_id, tx_date)
-    if not price or price <= 0:
-        logging.error(f"No price available for '{asset}' on {tx_date}; cannot value the transfer.")
-        return 1
-    proceeds = shares * price
-
-    cur.execute(
-        "SELECT currency, isin FROM transactions WHERE asset_name = ? AND currency IS NOT NULL AND currency != '' ORDER BY rowid LIMIT 1",
-        (asset,)
-    )
-    meta = cur.fetchone()
-    currency = meta[0] if meta and meta[0] else 'SEK'
-    isin = meta[1] if meta and meta[1] else '-'
-
-    # 1. Sälj on source (amount negative, total positive proceeds)
-    cur.execute(
-        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
-        "VALUES (?, ?, 'Sälj', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
-        (tx_date, from_acc, asset, -shares, price, proceeds, currency, isin)
-    )
-    # 2. Cash transfer pair (source → destination)
-    if not _insert_internal_transfer_pair(db, from_acc, to_acc, proceeds, tx_date):
+    result = _perform_asset_transfer(db, from_acc, to_acc, asset, shares, tx_date)
+    if result is None:
         db.conn.rollback()
-        logging.error("Asset sale rolled back — cash transfer failed (insufficient capital on source).")
+        logging.error("Asset transfer failed (likely insufficient capital on source for the cash leg); rolled back.")
         return 1
-    # 3. Köp on destination (amount positive, total negative cost)
-    cur.execute(
-        "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
-        "VALUES (?, ?, 'Köp', ?, ?, ?, ?, 0, ?, ?, 'virtual')",
-        (tx_date, to_acc, asset, shares, price, -proceeds, currency, isin)
-    )
+    proceeds, price = result
     db.commit()
     logging.info(f"Transferred {shares} shares of '{asset}' from '{from_acc}' to '{to_acc}' @ {price:.2f} (value {proceeds:.0f} SEK).")
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        return 1
+    return 0
+
+
+def virtual_list(args):
+    """List all virtual portfolios with parent, cash, assets, total and APY."""
+    db = get_db(args)
+    db.connect()
+    virtual_map = db.get_virtual_map()
+    if not virtual_map:
+        if getattr(args, 'format', 'table') == 'json':
+            print("[]")
+        else:
+            print("No virtual portfolios.")
+        return 0
+
+    stat_calc = StatCalculator(db)
+    summaries = {s[0]: s for s in stat_calc.get_account_summaries(None)}
+    nicknames = db.get_all_account_nicknames()
+    apy_mode = getattr(args, 'apy_mode', 'mwrr')
+
+    rows = []
+    for v_id in sorted(virtual_map):
+        parent = virtual_map[v_id]
+        s = summaries.get(v_id)
+        cash = s[1] if s else 0.0
+        assets = s[2] if s else 0.0
+        total = s[3] if s else 0.0
+        try:
+            apy, _ = stat_calc.calculate_account_apy(v_id, apy_mode=apy_mode, current_value=total)
+        except Exception:
+            apy = None
+        rows.append((v_id, parent, cash, assets, total, apy))
+
+    if getattr(args, 'format', 'table') == 'json':
+        import json
+        data = [{
+            'virtual': r[0],
+            'display_name': nicknames.get(r[0], r[0]),
+            'parent_account': r[1],
+            'cash': r[2],
+            'assets': r[3],
+            'total': r[4],
+            'apy': r[5],
+        } for r in rows]
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"{'Virtual':<20} {'Parent':<14} {'Cash (SEK)':>12} {'Assets (SEK)':>12} {'Total (SEK)':>12} {'APY':>9}")
+        print("-" * 83)
+        for v_id, parent, cash, assets, total, apy in rows:
+            apy_s = f"{apy:.1f}%" if apy is not None else "N/A"
+            disp = nicknames.get(v_id, v_id)
+            print(f"{disp:<20} {parent:<14} {cash:>12.0f} {assets:>12.0f} {total:>12.0f} {apy_s:>9}")
+    return 0
+
+
+def virtual_close(args):
+    """Move all holdings and residual cash from a virtual portfolio back to a
+    destination (its parent by default). The virtual account row is preserved so
+    its historical cohort data remains available; it simply ends up empty."""
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+    name = resolve_single_account(db, args.name)
+    if not db.is_virtual_account(name):
+        logging.error(f"'{args.name}' is not a virtual portfolio.")
+        return 1
+    parent = db.get_account_parent(name)
+    dest = resolve_single_account(db, args.to) if getattr(args, 'to', None) else parent
+    if not dest:
+        logging.error("No destination account (virtual has no parent and no --to given).")
+        return 1
+    tx_date = _parse_exact_date(args.date)
+
+    # Enumerate current holdings on the virtual (post-last-reprocess state).
+    cur.execute(
+        "SELECT a.asset, SUM(ca.amount) AS held "
+        "FROM cohort_assets ca JOIN assets a ON ca.asset_id = a.asset_id "
+        "WHERE ca.account = ? AND ca.amount > 0.0001 "
+        "GROUP BY a.asset ORDER BY a.asset",
+        (name,)
+    )
+    holdings = [(r[0], r[1]) for r in cur.fetchall()]
+
+    # Residual cash currently sitting on the virtual (from funding not spent on assets).
+    cur.execute("SELECT COALESCE(SUM(capital), 0) FROM cohort_data WHERE account = ?", (name,))
+    residual_cash = cur.fetchone()[0]
+
+    if not holdings and residual_cash <= 1e-4:
+        logging.info(f"Virtual '{name}' has no holdings and no cash; nothing to close.")
+        return 0
+
+    moved_assets = 0
+    for asset, shares in holdings:
+        if _perform_asset_transfer(db, name, dest, asset, shares, tx_date) is None:
+            db.conn.rollback()
+            logging.error(f"Failed to transfer '{asset}' during close; rolled back.")
+            return 1
+        moved_assets += 1
+
+    if residual_cash > 1e-4:
+        if not _insert_internal_transfer_pair(db, name, dest, residual_cash, tx_date):
+            db.conn.rollback()
+            logging.error(f"Failed to move residual cash ({residual_cash:.0f} SEK) during close; rolled back.")
+            return 1
+
+    db.commit()
+    logging.info(
+        f"Closed virtual '{name}': moved {moved_assets} asset(s) + {residual_cash:.0f} SEK cash to '{dest}'. "
+        f"Virtual account row preserved for history."
+    )
     if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
         return 1
     return 0
@@ -2126,6 +2258,17 @@ Examples:
     vp_xfer.add_argument('--to', required=True, help='Destination account')
     vp_xfer.add_argument('--date', required=True, help='Transfer date (YYYY-MM-DD)')
     vp_xfer.set_defaults(func=virtual_transfer)
+
+    vp_list = virtual_sub.add_parser('list', help='List all virtual portfolios with value and APY')
+    vp_list.add_argument('--apy-mode', choices=['mwrr', 'twrr'], default='mwrr', help='APY calculation method (default: mwrr)')
+    vp_list.add_argument('--format', choices=['table', 'json'], default='table', help='Output format (default: table)')
+    vp_list.set_defaults(func=virtual_list)
+
+    vp_close = virtual_sub.add_parser('close', help='Move all holdings and cash back to parent (liquidate/merge a virtual)')
+    vp_close.add_argument('--name', required=True, help='Virtual portfolio to close')
+    vp_close.add_argument('--to', default=None, help='Destination account (default: the virtual\'s parent)')
+    vp_close.add_argument('--date', required=True, help='Close date (YYYY-MM-DD)')
+    vp_close.set_defaults(func=virtual_close)
 
     # Status command
     status_parser = subparsers.add_parser('status', help='Show system status')
