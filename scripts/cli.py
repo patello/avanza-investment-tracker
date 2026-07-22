@@ -111,7 +111,14 @@ def import_data(args):
         # Import data
         rows_added = data_parser.add_data(args.file)
         logging.info(f"Added {rows_added} rows to the database")
-        
+
+        # Auto-route sells to the accounts that actually hold the shares, so a
+        # sell reported on the physical account does not abort reprocessing when
+        # the shares were allocated to a virtual portfolio. No-op without virtuals.
+        routed = route_imported_sells_to_holders(db)
+        if routed:
+            logging.info(f"Auto-routed {routed} sell(s) to virtual accounts holding the shares.")
+
         # Reset cohort tables (preserving asset_prices) so every import is a
         # clean rebuild — prevents stale cohort_assets entries from surviving
         # across imports with different transaction data.
@@ -1484,6 +1491,127 @@ def reprocess_after_virtual_change(db, special_cases_path):
     db.set_metadata('last_processed', now)
     db.set_metadata('last_stats_calculation', '')
     return 0
+
+
+def _account_family(account, virtual_map):
+    """Return the set of accounts considered 'related' to `account` for sell
+    routing: itself, its parent (if virtual) plus siblings, or its virtual
+    children (if physical)."""
+    family = {account}
+    parent = virtual_map.get(account)
+    if parent:
+        family.add(parent)
+        for v, p in virtual_map.items():
+            if p == parent:
+                family.add(v)
+    else:
+        for v, p in virtual_map.items():
+            if p == account:
+                family.add(v)
+    return family
+
+
+def route_imported_sells_to_holders(db):
+    """Reassign sells whose own account does not hold the asset to the account
+    that does (typically a virtual child), so reprocessing does not abort with
+    AssetDeficit. Intended to run after add_data and before reset_for_reprocessing.
+
+    Authority for "who holds what" is the pre-import cohort_assets snapshot (the
+    last-processed state). Rule per sell of N shares of X on account A:
+      * if A holds >= N -> leave (it will process against A's own shares)
+      * elif a related account holds the shortfall -> route/split there
+        (drain A first, then the largest related holder)
+      * else -> leave (genuine over-sell; reprocessing surfaces a clear error)
+
+    Returns the number of sells routed or split. No-op when no virtuals exist.
+    """
+    db.connect()
+    virtual_map = db.get_virtual_map()
+    if not virtual_map:
+        return 0
+    cur = db.get_cursor()
+
+    cur.execute(
+        "SELECT rowid, date, account, asset_name, amount, price, total, courtage, currency, isin "
+        "FROM transactions WHERE transaction_type='Sälj' AND origin='avanza'"
+    )
+    sells = cur.fetchall()
+    if not sells:
+        return 0
+
+    routed = 0
+    for row in sells:
+        rowid, tx_date, account, asset, amount, price, total, courtage, currency, isin = row
+        sell_shares = abs(amount)
+
+        cur.execute(
+            "SELECT ca.account, SUM(ca.amount) AS held "
+            "FROM cohort_assets ca JOIN assets a ON ca.asset_id = a.asset_id "
+            "WHERE a.asset = ? AND ca.amount > 0 "
+            "GROUP BY ca.account",
+            (asset,)
+        )
+        holders = {r[0]: r[1] for r in cur.fetchall()}
+        if not holders:
+            continue  # nobody holds it yet (e.g. buy in same CSV) -> leave
+
+        a_held = holders.get(account, 0)
+        if a_held + 1e-6 >= sell_shares:
+            continue  # account covers the sell
+
+        family = _account_family(account, virtual_map)
+        candidates = sorted(
+            [(acc, h) for acc, h in holders.items() if acc != account and acc in family],
+            key=lambda x: -x[1]
+        )
+        if not candidates:
+            continue  # only unrelated holders — unexpected; leave for manual
+
+        largest_acc, largest_held = candidates[0]
+        shortfall = sell_shares - a_held
+
+        if largest_held + 1e-6 < shortfall:
+            logging.warning(
+                f"Sell of {sell_shares} '{asset}' on '{account}' needs {shortfall:.4f} from virtuals "
+                f"but largest holder '{largest_acc}' holds {largest_held:.4f}; left for manual allocation."
+            )
+            continue
+
+        if len(candidates) > 1:
+            logging.warning(
+                f"Multiple virtuals hold '{asset}'; routing sell to '{largest_acc}' (largest holding). "
+                f"Re-allocate manually if a different split was intended."
+            )
+
+        sign = -1 if amount < 0 else 1
+        if a_held <= 1e-6:
+            # Account holds none: move the entire sell to the virtual holder.
+            cur.execute("UPDATE transactions SET account = ? WHERE rowid = ?", (largest_acc, rowid))
+            logging.info(f"Auto-routed sell of {sell_shares} '{asset}' from '{account}' to '{largest_acc}'.")
+        else:
+            # Split: account sells what it holds, virtual sells the shortfall.
+            frac = a_held / sell_shares
+            acct_total = total * frac
+            acct_courtage = courtage * frac
+            cur.execute(
+                "UPDATE transactions SET amount = ?, total = ?, courtage = ? WHERE rowid = ?",
+                (sign * a_held, acct_total, acct_courtage, rowid)
+            )
+            cur.execute(
+                "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+                "VALUES (?, ?, 'Sälj', ?, ?, ?, ?, ?, ?, ?, 'avanza')",
+                (tx_date, largest_acc, asset, sign * shortfall, price,
+                 total - acct_total, courtage - acct_courtage, currency, isin)
+            )
+            logging.info(
+                f"Auto-split sell of {sell_shares} '{asset}': {a_held} on '{account}', "
+                f"{shortfall} routed to '{largest_acc}'."
+            )
+        routed += 1
+
+    if routed:
+        db.commit()
+    return routed
 
 
 def _insert_internal_transfer_pair(db, from_acc, to_acc, amount, tx_date):

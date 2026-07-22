@@ -506,3 +506,88 @@ def test_virtual_close_nothing_to_close(tmp_path):
     cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
     rc = cli.virtual_close(_ns(db_file, name="YOLO", to=None, date="2020-09-01"))
     assert rc == 0  # empty virtual — no-op success
+
+
+# ---------- auto-routing of sells to the holding account ----------
+
+def _import_more(db_file, csv_text, tmp_path):
+    """Append transactions from a CSV, run sell-routing, then reprocess.
+    Returns the number of sells routed."""
+    csv_file = _write_csv(tmp_path, "more.csv", csv_text)
+    db = DatabaseHandler(db_file)
+    db.connect()
+    parser = DataParser(db)
+    parser.add_data(csv_file)
+    routed = cli.route_imported_sells_to_holders(db)
+    parser.reset_for_reprocessing()
+    parser.process_transactions()
+    db.disconnect()
+    return routed
+
+
+# Sälj CSV row uses negative Antal (shares leaving), positive Belopp (proceeds).
+_SELL = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat\n"
+
+
+def test_sell_routed_when_parent_holds_none(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    # Allocate ALL 100 shares to YOLO -> parent holds 0
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(0, abs=1e-6)
+
+    csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 1
+    # Without routing this would have been an AssetDeficit; instead YOLO lost 30.
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(70, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(0, abs=1e-6)
+
+
+def test_sell_split_when_parent_holds_partial(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    # Parent keeps 60, YOLO gets 40
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(60, abs=1e-6)
+
+    # Sell 80 > parent's 60 -> split: parent sells 60, YOLO sells 20
+    csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-80;100;8000;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 1
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(0, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(20, abs=1e-6)
+
+
+def test_sell_left_alone_when_parent_holds_enough(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=40))
+    # Parent holds 60 >= sell of 30 -> left on parent
+    csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 0
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(30, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(40, abs=1e-6)
+
+
+def test_sell_routing_noop_without_virtuals(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    # No virtuals; sell of 30 on parent (holds 100) stays put
+    csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
+    routed = _import_more(db_file, csv, tmp_path)
+    assert routed == 0
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(70, abs=1e-6)
+
+
+def test_sell_routing_e2e_via_import_command(tmp_path):
+    """Full import_data path triggers routing automatically."""
+    db_file = _base_parent_db(tmp_path)
+    cli.virtual_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.virtual_allocate(_ns(db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None))
+
+    sell_csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-30;100;3000;0;SEK;ASSETA;-"
+    sell_file = _write_csv(tmp_path, "sell.csv", sell_csv)
+    rc = cli.import_data(argparse.Namespace(database=str(db_file), special_cases=None, file=sell_file))
+    assert rc == 0
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(70, abs=1e-6)
