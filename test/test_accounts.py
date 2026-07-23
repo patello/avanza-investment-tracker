@@ -792,3 +792,247 @@ def test_report_json_shape(tmp_path, capsys):
     assert data['virtual_portfolios'][0]['parent_account'] == '1111'
     # accounts tree nests virtuals under their physical parent
     assert data['accounts'][0]['children'][0]['account'] == 'YOLO'
+
+
+# ---------- partial transfer fix (account allocate) ----------
+
+def test_allocate_full_transfer_when_virtual_has_no_cash(tmp_path):
+    """Virtual has 0 cash -> transfers full buy cost (existing behaviour)."""
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    assert rc == 0
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM transactions "
+        "WHERE transaction_type='Intern överföring' AND origin='virtual' "
+        "AND account='YOLO' AND date='2020-01-01'"
+    )
+    assert cur.fetchone()[0] == pytest.approx(10000, abs=1)
+    db.disconnect()
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+
+def test_allocate_partial_transfer_only_moves_shortfall(tmp_path):
+    """Virtual has some cash -> transfers only the shortfall."""
+    db_file = _base_parent_db(tmp_path)
+    # Pre-fund YOLO with 6000 (dated before buy so month filter includes it)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=6000, starting_cash_date="2019-12-15"))
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    assert rc == 0
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    # Starting-cash transfer (dated 2019-12-15)
+    cur.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM transactions "
+        "WHERE transaction_type='Intern överföring' AND origin='virtual' "
+        "AND account='YOLO' AND date='2019-12-15'"
+    )
+    assert cur.fetchone()[0] == pytest.approx(6000, abs=1)
+    # Allocate shortfall transfer (dated 2020-01-01, day before buy)
+    cur.execute(
+        "SELECT COALESCE(SUM(total), 0) FROM transactions "
+        "WHERE transaction_type='Intern överföring' AND origin='virtual' "
+        "AND account='YOLO' AND date='2020-01-01'"
+    )
+    assert cur.fetchone()[0] == pytest.approx(4000, abs=1)  # shortfall, not 10000
+    db.disconnect()
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+
+def test_allocate_no_transfer_when_virtual_has_enough_cash(tmp_path):
+    """Virtual has enough cash from a prior transfer -> no new transfer."""
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    # Fund YOLO with exactly the buy cost
+    cli.account_transfer_cash(_ns(db_file, from_account="1111", to="YOLO", amount=10000, date="2020-01-01"))
+    transfers_before = _count_virtual_transfers(db_file)
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    assert rc == 0
+    # No new transfer pair
+    assert _count_virtual_transfers(db_file) == transfers_before
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+
+# ---------- undo mode (allocate to parent) ----------
+
+def test_allocate_undo_moves_buy_back_and_deletes_transfer(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+    assert _count_virtual_transfers(db_file) == 2  # one pair
+
+    # Undo: allocate back to parent
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="1111", from_account="YOLO", shares=None
+    ))
+    assert rc == 0
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("SELECT account FROM transactions WHERE transaction_type='Köp' AND origin='avanza'")
+    assert cur.fetchone()[0] == "1111"
+    cur.execute("SELECT COUNT(*) FROM transactions WHERE transaction_type='Intern överföring' AND origin='virtual'")
+    assert cur.fetchone()[0] == 0  # transfer pair deleted
+    db.disconnect()
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(100, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(0, abs=1e-6)
+
+
+def test_allocate_undo_requires_from_flag(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="1111", from_account=None, shares=None
+    ))
+    assert rc == 1
+
+
+def test_allocate_undo_rejects_partial(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    rc = cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="1111", from_account="YOLO", shares=30
+    ))
+    assert rc == 1
+
+
+# ---------- auto-allocate buys (--allocate-virtual) ----------
+
+_BUY = "Datum;Konto;Typ av transaktion;Värdepapper/beskrivning;Antal;Kurs;Belopp;Courtage;Valuta;ISIN;Resultat\n"
+
+
+def _import_with_allocate(db_file, csv_text, tmp_path):
+    """Import with auto-allocate enabled. Returns count of buys allocated."""
+    csv_file = _write_csv(tmp_path, "alloc.csv", csv_text)
+    db = DatabaseHandler(db_file)
+    db.connect()
+    parser = DataParser(db)
+    parser.add_data(csv_file)
+    cli.route_imported_sells_to_holders(db)
+    cli.route_imported_dividends_to_holders(db)
+    allocated = cli.auto_allocate_buys_to_virtuals(db)
+    parser.reset_for_reprocessing()
+    try:
+        parser.process_transactions()
+    except AssetDeficit:
+        pass  # expected when buys are left unallocated on an unfundable parent
+    db.disconnect()
+    return allocated
+
+
+def _count_virtual_transfers(db_file):
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("SELECT COUNT(*) FROM transactions WHERE transaction_type='Intern överföring' AND origin='virtual'")
+    n = cur.fetchone()[0]
+    db.disconnect()
+    return n
+
+
+def test_auto_allocate_noop_without_virtuals(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    buy_csv = _BUY + "2020-06-01;1111;Köp;Asset B;10;100;-1000;0;SEK;ASSETB;-"
+    allocated = _import_with_allocate(db_file, buy_csv, tmp_path)
+    assert allocated == 0
+    assert _holdings(DatabaseHandler(db_file), "1111", "Asset B") == pytest.approx(10, abs=1e-6)
+
+
+def test_auto_allocate_parent_can_fund_skipped(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    # Parent has 10000 cash -> can fund a 1000 buy
+    buy_csv = _BUY + "2020-06-01;1111;Köp;Asset B;10;100;-1000;0;SEK;ASSETB;-"
+    allocated = _import_with_allocate(db_file, buy_csv, tmp_path)
+    assert allocated == 0
+    assert _holdings(DatabaseHandler(db_file), "1111", "Asset B") == pytest.approx(10, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO", "Asset B") == pytest.approx(0, abs=1e-6)
+
+
+def test_auto_allocate_rebuy_to_virtual(tmp_path):
+    """Sell in virtual -> cash in virtual -> rebuy on parent -> auto-allocated to virtual."""
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    # Sell 50 shares -> auto-routed to YOLO -> YOLO gets 6000 cash
+    sell_csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-50;120;6000;0;SEK;ASSETA;-"
+    _import_more(db_file, sell_csv, tmp_path)
+    # Drain parent cash so new buy can't fund there
+    cli.account_transfer_cash(_ns(db_file, from_account="1111", to="YOLO", amount=10000, date="2020-06-15"))
+    transfers_before = _count_virtual_transfers(db_file)
+    # Import rebuy on parent
+    buy_csv = _BUY + "2020-07-01;1111;Köp;Asset A;50;120;-6000;0;SEK;ASSETA;-"
+    allocated = _import_with_allocate(db_file, buy_csv, tmp_path)
+    assert allocated == 1
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(0, abs=1e-6)
+    # No new transfer pair (YOLO had enough cash from sell)
+    assert _count_virtual_transfers(db_file) == transfers_before
+
+
+def test_auto_allocate_new_asset_one_virtual_has_cash(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=10000, starting_cash_date="2019-12-15"))
+    # Drain parent cash
+    cli.account_transfer_cash(_ns(db_file, from_account="1111", to="YOLO", amount=10000, date="2020-03-01"))
+    # Buy new asset on parent
+    buy_csv = _BUY + "2020-07-01;1111;Köp;Asset B;50;100;-5000;0;SEK;ASSETB;-"
+    allocated = _import_with_allocate(db_file, buy_csv, tmp_path)
+    assert allocated == 1
+    assert _holdings(DatabaseHandler(db_file), "YOLO", "Asset B") == pytest.approx(50, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "1111", "Asset B") == pytest.approx(0, abs=1e-6)
+
+
+def test_auto_allocate_new_asset_multiple_virtuals_warns(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    # Split parent's 10000 cash between two virtuals
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=5000, starting_cash_date="2019-12-15"))
+    cli.account_create(_ns(db_file, name="GROWTH", parent="1111", starting_cash=5000, starting_cash_date="2019-12-15"))
+    # Parent: 0 cash. YOLO: 5000. GROWTH: 5000.
+    # Buy new asset on parent — both virtuals have cash, ambiguous
+    buy_csv = _BUY + "2020-07-01;1111;Köp;Asset B;40;100;-4000;0;SEK;ASSETB;-"
+    allocated = _import_with_allocate(db_file, buy_csv, tmp_path)
+    assert allocated == 0  # left for manual allocation
+    assert _holdings(DatabaseHandler(db_file), "1111", "Asset B") == pytest.approx(0, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO", "Asset B") == pytest.approx(0, abs=1e-6)
+
+
+def test_auto_allocate_e2e_via_import_command(tmp_path):
+    """Full import_data path with --allocate-virtual."""
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    sell_csv = _SELL + "2020-06-01;1111;Sälj;Asset A;-50;120;6000;0;SEK;ASSETA;-"
+    _import_more(db_file, sell_csv, tmp_path)
+    cli.account_transfer_cash(_ns(db_file, from_account="1111", to="YOLO", amount=10000, date="2020-06-15"))
+
+    buy_csv = _BUY + "2020-07-01;1111;Köp;Asset A;50;120;-6000;0;SEK;ASSETA;-"
+    buy_file = _write_csv(tmp_path, "buy.csv", buy_csv)
+    rc = cli.import_data(argparse.Namespace(
+        database=str(db_file), special_cases=None, file=buy_file, allocate_virtual=True
+    ))
+    assert rc == 0
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)

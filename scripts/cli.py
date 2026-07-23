@@ -124,6 +124,14 @@ def import_data(args):
                 f"Auto-routed {routed_sells} sell(s) and {routed_divs} dividend(s) to virtual accounts holding the shares."
             )
 
+        # Auto-allocate buys to virtual portfolios using cash + holdings
+        # heuristics. Only runs when --allocate-virtual is passed. No-op
+        # without virtuals.
+        if getattr(args, 'allocate_virtual', False):
+            allocated_buys = auto_allocate_buys_to_virtuals(db)
+            if allocated_buys:
+                logging.info(f"Auto-allocated {allocated_buys} buy(s) to virtual portfolios.")
+
         # Reset cohort tables (preserving asset_prices) so every import is a
         # clean rebuild — prevents stale cohort_assets entries from surviving
         # across imports with different transaction data.
@@ -1699,6 +1707,188 @@ def route_imported_dividends_to_holders(db):
     return routed
 
 
+def auto_allocate_buys_to_virtuals(db):
+    """Auto-allocate imported buys on parent accounts to the virtual that
+    should hold them, using cash and holdings heuristics.
+
+    Runs after auto-routing of sells/dividends, before reset_for_reprocessing.
+    Uses the pre-import cohort snapshot (last-processed state) for capital and
+    holdings lookups. No-op without virtuals.
+
+    Heuristics per buy (Koep, origin='avanza') on a parent that cannot fund it:
+      1. A virtual that both holds the asset and can be funded -> allocate there.
+         If multiple, pick the largest holder (WARNING).
+      2. New asset (nobody holds it) and exactly one virtual can fund -> allocate.
+      3. Everything else -> leave with WARNING.
+
+    'Can be funded' = virtual_capital + remaining_parent_capital >= buy_cost.
+    The shortfall is transferred from parent to virtual via a direct Intern
+    oeverfoering insert (origin='virtual'), dated the day before the buy.
+
+    Returns the number of buys re-allocated.
+    """
+    db.connect()
+    virtual_map = db.get_virtual_map()
+    if not virtual_map:
+        return 0
+    cur = db.get_cursor()
+
+    parents_with_virtuals = {}
+    for v, p in virtual_map.items():
+        parents_with_virtuals.setdefault(p, set()).add(v)
+    if not parents_with_virtuals:
+        return 0
+
+    parent_list = list(parents_with_virtuals.keys())
+    ph = ','.join('?' * len(parent_list))
+
+    cur.execute(
+        f"SELECT rowid, date, account, asset_name, amount, price, total "
+        f"FROM transactions WHERE transaction_type='Köp' AND origin='avanza' "
+        f"AND account IN ({ph}) ORDER BY date ASC, rowid ASC",
+        parent_list
+    )
+    buys = cur.fetchall()
+    if not buys:
+        return 0
+
+    # Running adjustments from transfers and buy consumptions within this
+    # function.  Queried capital is the pre-import snapshot filtered to the
+    # buy's month (capital from later months is not available yet at the
+    # buy's date during reprocessing); adjustments reflect prior allocations.
+    adjustments = {}
+
+    def _avail(acc, buy_month):
+        cur.execute(
+            "SELECT COALESCE(SUM(capital), 0) FROM cohort_data "
+            "WHERE account = ? AND capital > 0 AND month <= ?",
+            (acc, buy_month)
+        )
+        return cur.fetchone()[0] + adjustments.get(acc, 0)
+
+    allocated = 0
+    for rowid, tx_date_str, account, asset, amount, price, total in buys:
+        buy_cost = abs(total)
+        tx_date_str = str(tx_date_str)  # normalise date objects from SQLite
+        buy_month = tx_date_str[:7]
+
+        # Step 0: Can the parent fund this buy alone?
+        if _avail(account, buy_month) + 1e-3 >= buy_cost:
+            continue
+
+        virtuals = parents_with_virtuals[account]
+
+        # Look up asset_id for holdings check
+        cur.execute("SELECT asset_id FROM assets WHERE asset = ?", (asset,))
+        asset_row = cur.fetchone()
+        asset_id = asset_row[0] if asset_row else None
+
+        # Step 1: Virtuals that both hold the asset AND can be funded
+        holders_with_cash = []
+        total_held_anywhere = 0.0
+        if asset_id:
+            cur.execute(
+                "SELECT account, SUM(amount) AS held "
+                "FROM cohort_assets WHERE asset_id = ? AND amount > 0 "
+                "GROUP BY account",
+                (asset_id,)
+            )
+            all_holders = {r[0]: r[1] for r in cur.fetchall()}
+            total_held_anywhere = sum(all_holders.values())
+            parent_cash = _avail(account, buy_month)
+            for v in virtuals:
+                held = all_holders.get(v, 0)
+                if held > 1e-6:
+                    v_cash = _avail(v, buy_month)
+                    if v_cash + parent_cash + 1e-3 >= buy_cost:
+                        holders_with_cash.append((v, held, v_cash))
+
+        if holders_with_cash:
+            holders_with_cash.sort(key=lambda x: -x[1])
+            target, target_held, target_cash = holders_with_cash[0]
+            if len(holders_with_cash) > 1:
+                logging.warning(
+                    f"Multiple virtuals hold '{asset}'; allocating buy of {abs(amount)} shares "
+                    f"to '{target}' (largest holding of {target_held:.1f})."
+                )
+            else:
+                logging.info(
+                    f"Auto-allocated buy of {abs(amount)} '{asset}' on '{account}' -> '{target}' "
+                    f"(holds {target_held:.1f} shares, can fund)."
+                )
+        elif total_held_anywhere < 1e-6:
+            # Step 2: New asset (nobody holds it) -- which virtuals can fund?
+            parent_cash = _avail(account, buy_month)
+            fundable = []
+            for v in virtuals:
+                v_cash = _avail(v, buy_month)
+                if v_cash + parent_cash + 1e-3 >= buy_cost:
+                    fundable.append((v, v_cash))
+
+            if len(fundable) == 1:
+                target = fundable[0][0]
+                target_cash = fundable[0][1]
+                logging.info(
+                    f"Auto-allocated buy of new asset '{asset}' on '{account}' -> '{target}' "
+                    f"(only virtual with sufficient cash)."
+                )
+            else:
+                if len(fundable) > 1:
+                    logging.warning(
+                        f"Buy of new asset '{asset}' on '{account}': parent can't fund "
+                        f"({_avail(account, buy_month):.0f} SEK), multiple virtuals have cash "
+                        f"-- manual allocation needed."
+                    )
+                else:
+                    logging.warning(
+                        f"Buy of '{asset}' on '{account}': no account can fund the "
+                        f"{buy_cost:.0f} SEK cost -- manual allocation needed."
+                    )
+                continue
+        else:
+            # Step 3: Asset is held by virtual(s) but none can be funded
+            logging.warning(
+                f"Buy of '{asset}' on '{account}': held by virtual(s) but none can "
+                f"be funded -- manual allocation needed."
+            )
+            continue
+
+        # -- Execute allocation --
+        cur.execute("UPDATE transactions SET account = ? WHERE rowid = ?", (target, rowid))
+
+        # Fund: transfer shortfall from parent to virtual
+        shortfall = max(0, buy_cost - target_cash)
+        if shortfall > 1e-4:
+            fund_date = str(_parse_exact_date(tx_date_str) - timedelta(days=1))
+            cur.execute(
+                "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+                "VALUES (?, ?, 'Intern överföring', ?, 0, 0, ?, 0, 'SEK', '-', 'virtual')",
+                (fund_date, account, f"Transfer to {target}", -shortfall)
+            )
+            cur.execute(
+                "INSERT INTO transactions (date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin, origin) "
+                "VALUES (?, ?, 'Intern överföring', ?, 0, 0, ?, 0, 'SEK', '-', 'virtual')",
+                (fund_date, target, f"Transfer from {account}", shortfall)
+            )
+            adjustments[account] = adjustments.get(account, 0) - shortfall
+            adjustments[target] = adjustments.get(target, 0) + shortfall
+            logging.info(
+                f"  Moved {shortfall:.0f} SEK from '{account}' to '{target}' to fund the buy "
+                f"(virtual had {target_cash:.0f} SEK)."
+            )
+        else:
+            logging.info(
+                f"  '{target}' has sufficient capital ({target_cash:.0f} SEK); no transfer needed."
+            )
+
+        adjustments[target] = adjustments.get(target, 0) - buy_cost
+        allocated += 1
+
+    if allocated:
+        db.commit()
+    return allocated
+
+
 def _insert_internal_transfer_pair(db, from_acc, to_acc, amount, tx_date):
     """Insert a paired 'Intern överföring' (origin='virtual') moving `amount`
     from `from_acc` to `to_acc` on `tx_date`. The pair is consumed by
@@ -1769,22 +1959,86 @@ def account_create(args):
 
 
 def account_allocate(args):
-    """Allocate a transaction (full or partial split) to a virtual portfolio."""
+    """Allocate a transaction (full or partial split) to a virtual portfolio,
+    or undo a prior allocation by targeting the parent account."""
     db = get_db(args)
     db.connect()
     cur = db.get_cursor()
     to_account = resolve_single_account(db, args.to)
+    tx_date = _parse_exact_date(args.tx_date)
+    asset = args.tx_asset.strip()
+
+    # ── Undo mode: target is a physical (parent) account ──────────────────
+    # Moves transactions back from a virtual to the parent and deletes the
+    # funding transfer pair — no compensating transactions are created.
     if not db.is_virtual_account(to_account):
-        logging.error(f"Target '{args.to}' is not a virtual portfolio. Create it first with `virtual create`.")
-        return 1
+        if not args.from_account:
+            logging.error("Undo requires --from <virtual> to identify which virtual to pull from.")
+            return 1
+        source = resolve_single_account(db, args.from_account)
+        if not db.is_virtual_account(source):
+            logging.error(f"Source '{source}' is not a virtual portfolio.")
+            return 1
+        actual_parent = db.get_account_parent(source)
+        if to_account != actual_parent:
+            logging.error(
+                f"Target '{to_account}' is not the parent of virtual '{source}' "
+                f"(parent is '{actual_parent}')."
+            )
+            return 1
+        if args.shares is not None:
+            logging.error(
+                "Partial undo (--shares) is not supported. Undo the full allocation, "
+                "then re-allocate with the correct split."
+            )
+            return 1
+
+        cur.execute(
+            "SELECT rowid, date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin "
+            "FROM transactions WHERE date = ? AND account = ? AND asset_name = ? AND origin = 'avanza' "
+            "ORDER BY rowid",
+            (tx_date, source, asset)
+        )
+        matches = cur.fetchall()
+        if not matches:
+            logging.error(f"No transactions found on '{source}' for '{asset}' on {tx_date}.")
+            return 1
+
+        allocatable = ('Köp', 'Sälj', 'Utdelning', 'Räntor', 'Ränta', 'Inlåningsränta', 'Utlåningsränta',
+                       'Tillgångsinsättning', 'Värdepappersuttag', 'Intern överföring',
+                       'Insättning', 'Autogiroinsättning', 'Uttag')
+        count = 0
+        for m in matches:
+            if m[3] not in allocatable:
+                logging.warning(f"Skipping {m[3]} (rowid {m[0]}) — not allocatable.")
+                continue
+            cur.execute("UPDATE transactions SET account = ? WHERE rowid = ?", (to_account, m[0]))
+            count += 1
+
+        fund_date = tx_date - timedelta(days=1)
+        cur.execute(
+            "DELETE FROM transactions "
+            "WHERE transaction_type = 'Intern överföring' AND origin = 'virtual' "
+            "AND date = ? AND (account = ? OR account = ?)",
+            (str(fund_date), to_account, source)
+        )
+        deleted = cur.rowcount
+
+        db.commit()
+        logging.info(
+            f"Undid allocation: moved {count} transaction(s) from '{source}' back to '{to_account}', "
+            f"deleted {deleted} funding transfer row(s)."
+        )
+        if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+            return 1
+        return 0
+
+    # ── Normal allocate mode: target is a virtual portfolio ───────────────
     parent = db.get_account_parent(to_account)
     source = resolve_single_account(db, args.from_account) if args.from_account else parent
     if not source:
         logging.error("No source account resolved (virtual has no parent and no --from given).")
         return 1
-
-    tx_date = _parse_exact_date(args.tx_date)
-    asset = args.tx_asset.strip()
 
     cur.execute(
         "SELECT rowid, date, account, transaction_type, asset_name, amount, price, total, courtage, currency, isin "
@@ -1802,10 +2056,9 @@ def account_allocate(args):
 
     # Capital that must follow the shares: a buy (Köp) consumes capital, so when
     # it is moved to the virtual the virtual must be funded with the buy's cost,
-    # otherwise reprocessing fails (the buy is unfundable on the virtual). We move
-    # the cost from the source account via an internal transfer dated the day
-    # before the buy so it processes first. (The issue's "allocation = reassign
-    # only" model breaks reprocessing for buys; this corrects it.)
+    # otherwise reprocessing fails (the buy is unfundable on the virtual). We
+    # transfer only the shortfall — if the virtual already has capital (e.g. from
+    # a prior sell), the existing funds are used and no transfer is needed.
     buy_cost_to_move = 0.0
 
     if args.shares is None:
@@ -1858,11 +2111,28 @@ def account_allocate(args):
 
     if buy_cost_to_move > 1e-4:
         fund_date = tx_date - timedelta(days=1)
-        if not _insert_internal_transfer_pair(db, source, to_account, buy_cost_to_move, fund_date):
-            db.conn.rollback()
-            logging.error("Could not move capital to fund the allocated buy(s); rolled back.")
-            return 1
-        logging.info(f"Moved {buy_cost_to_move:.0f} SEK from '{source}' to '{to_account}' to fund the allocated buy(s).")
+        buy_month = tx_date.strftime("%Y-%m")
+        cur.execute(
+            "SELECT COALESCE(SUM(capital), 0) FROM cohort_data "
+            "WHERE account = ? AND capital > 0 AND month <= ?",
+            (to_account, buy_month)
+        )
+        virtual_cash = cur.fetchone()[0]
+        shortfall = buy_cost_to_move - virtual_cash
+        if shortfall > 1e-4:
+            if not _insert_internal_transfer_pair(db, source, to_account, shortfall, fund_date):
+                db.conn.rollback()
+                logging.error("Could not move capital to fund the allocated buy(s); rolled back.")
+                return 1
+            logging.info(
+                f"Moved {shortfall:.0f} SEK from '{source}' to '{to_account}' to fund the allocated buy(s) "
+                f"(virtual had {virtual_cash:.0f} SEK)."
+            )
+        else:
+            logging.info(
+                f"Virtual '{to_account}' has sufficient capital ({virtual_cash:.0f} SEK) "
+                f"for the allocated buy(s); no transfer needed."
+            )
 
     db.commit()
     if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
@@ -2417,6 +2687,10 @@ Examples:
     # Import command
     import_parser = subparsers.add_parser('import', help='Import CSV data and process transactions')
     import_parser.add_argument('file', help='Path to CSV file')
+    import_parser.add_argument(
+        '--allocate-virtual', action='store_true',
+        help='Auto-allocate buys to virtual portfolios using cash + holdings heuristics'
+    )
     import_parser.set_defaults(func=import_data)
     
     # Stats command

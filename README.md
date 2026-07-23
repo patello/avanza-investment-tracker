@@ -348,7 +348,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 
 | Command | Description |
 | :--- | :--- |
-| `python scripts/cli.py import FILE` | Import transaction entries from Avanza CSV |
+| `python scripts/cli.py import FILE [--allocate-virtual]` | Import transaction entries from Avanza CSV (auto-allocate buys to virtuals) |
 | `python scripts/cli.py stats [OPTIONS]` | Calculate and display cohort performance statistics (TWRR, deposits) |
 | `python scripts/cli.py accounts [OPTIONS]` | Display summary of all accounts with asset values and cash |
 | `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (alias to `stats --positions --summary`) |
@@ -433,7 +433,8 @@ python cli.py account nickname --remove 1234567
 
 ### How it works
 
-- **`allocate`** moves a transaction (or splits it) onto the virtual account. Moving a buy automatically transfers the buy's cost from the parent so the virtual can fund it. Partial splits proportionally divide `total` and `courtage`.
+- **`allocate`** moves a transaction (or splits it) onto the virtual account. Moving a buy transfers only the **shortfall** — if the virtual already has capital (e.g. from a prior sell), that cash is used and no transfer is needed. Partial splits proportionally divide `total` and `courtage`.
+- **`allocate --to <parent>`** (undo) moves a transaction back from a virtual to the parent and **deletes** the funding transfer pair that was created during the original allocation. No compensating transactions are created. Requires `--from <virtual>`. Partial undo (`--shares`) is not supported.
 - **`transfer`** (asset move) is represented internally as a sell on the source → cash transfer → rebuy on the destination (all tagged as synthetic). This composes the existing transaction handlers and is correct on every statistics path. The **source realizes its gain** up to the transfer and the **destination gets a fresh cost basis** at the transfer price — an honest "this position left / entered the strategy" bookkeeping.
 - **`close`** moves every holding (via the same decomposition) plus any residual cash back to the parent, then reprocesses. The virtual account row is **preserved** (kept `is_virtual = 1`) so its historical cohort/performance data remains queryable; it simply ends up empty.
 - After every `account` mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
@@ -491,6 +492,12 @@ for the benchmark period return.
   - **Sells**: drain the sell's own account first, then the largest related virtual holder; full reassignment when the own account holds none, proportional split when it holds some but not enough. Multi-holder cases route to the largest with a warning.
   - **Dividends**: split proportionally across every holder so each account is credited for the shares it actually holds.
   - This runs only when virtual portfolios exist (no-op otherwise).
+- **Buys can be auto-allocated with `import --allocate-virtual`.** When a buy on a parent account cannot be funded (because cash is stranded in a virtual from a prior sell), the flag applies heuristics to assign it to the right virtual:
+  1. A virtual that **both holds the asset and can fund the buy** → allocate there (largest holder if multiple, with a warning).
+  2. A **new asset** (nobody holds it) and exactly one virtual can fund → allocate there.
+  3. Everything else → left on the parent with a warning for manual allocation.
+  - "Can fund" means the virtual's capital plus the parent's remaining capital covers the buy cost. The shortfall is transferred from the parent.
+  - If a heuristic allocation is wrong, undo it with `account allocate --to <parent> --from <virtual>`.
 - Funding a virtual requires the source account to hold enough capital at the transfer date.
 
 ## Special Cases
