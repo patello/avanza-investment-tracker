@@ -1036,3 +1036,119 @@ def test_auto_allocate_e2e_via_import_command(tmp_path):
     ))
     assert rc == 0
     assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+
+# ---------- account delete (clean teardown) ----------
+
+def test_delete_reverts_transactions_and_removes_virtual(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(100, abs=1e-6)
+
+    rc = cli.account_delete(_ns(db_file, name="YOLO"))
+    assert rc == 0
+
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    # Buy reverted to parent
+    cur.execute("SELECT account FROM transactions WHERE transaction_type='Köp' AND origin='avanza'")
+    assert cur.fetchone()[0] == "1111"
+    # No virtual transactions left
+    cur.execute("SELECT COUNT(*) FROM transactions WHERE origin='virtual'")
+    assert cur.fetchone()[0] == 0
+    # Account row gone
+    cur.execute("SELECT COUNT(*) FROM accounts WHERE account_id='YOLO'")
+    assert cur.fetchone()[0] == 0
+    db.disconnect()
+    # Holdings restored on parent
+    assert _holdings(DatabaseHandler(db_file), "1111") == pytest.approx(100, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(0, abs=1e-6)
+
+
+def test_delete_removes_cash_transfer_traces(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=5000, starting_cash_date="2020-02-01"))
+    assert _count_virtual_transfers(db_file) == 2  # one pair from starting_cash
+
+    rc = cli.account_delete(_ns(db_file, name="YOLO"))
+    assert rc == 0
+    assert _count_virtual_transfers(db_file) == 0
+
+
+def test_delete_cleans_up_asset_transfer_partners(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=None
+    ))
+    cli.account_create(_ns(db_file, name="GROWTH", parent="1111", starting_cash=5000, starting_cash_date="2020-02-01"))
+    # Transfer 40 shares from YOLO to GROWTH
+    cli.account_transfer(_ns(
+        db_file, from_account="YOLO", to="GROWTH", asset="Asset A", shares=40, date="2020-03-01"
+    ))
+    assert _holdings(DatabaseHandler(db_file), "GROWTH") == pytest.approx(40, abs=1e-6)
+
+    transfers_before = _count_virtual_transfers(db_file)
+
+    rc = cli.account_delete(_ns(db_file, name="YOLO"))
+    assert rc == 0
+
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    # No origin='virtual' transactions referencing YOLO remain
+    cur.execute(
+        "SELECT COUNT(*) FROM transactions WHERE origin='virtual' AND "
+        "(account='YOLO' OR asset_name LIKE '%YOLO%')"
+    )
+    assert cur.fetchone()[0] == 0
+    # The transfer Köp on GROWTH is deleted (origin='virtual')
+    cur.execute(
+        "SELECT COUNT(*) FROM transactions WHERE origin='virtual' AND transaction_type='Köp' AND account='GROWTH'"
+    )
+    assert cur.fetchone()[0] == 0
+    # GROWTH's own starting_cash transfer is preserved (not from/to YOLO)
+    cur.execute(
+        "SELECT COUNT(*) FROM transactions WHERE origin='virtual' AND transaction_type='Intern överföring' "
+        "AND account='GROWTH' AND asset_name='Transfer from 1111'"
+    )
+    assert cur.fetchone()[0] == 1
+    db.disconnect()
+
+
+def test_delete_other_virtuals_unaffected(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    cli.account_create(_ns(db_file, name="YOLO", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_create(_ns(db_file, name="GROWTH", parent="1111", starting_cash=None, starting_cash_date=None))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="YOLO", from_account=None, shares=50
+    ))
+    cli.account_allocate(_ns(
+        db_file, tx_date="2020-01-02", tx_asset="Asset A", to="GROWTH", from_account=None, shares=30
+    ))
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(50, abs=1e-6)
+    assert _holdings(DatabaseHandler(db_file), "GROWTH") == pytest.approx(30, abs=1e-6)
+
+    rc = cli.account_delete(_ns(db_file, name="YOLO"))
+    assert rc == 0
+
+    # GROWTH still exists and has its shares
+    assert _holdings(DatabaseHandler(db_file), "GROWTH") == pytest.approx(30, abs=1e-6)
+    db = DatabaseHandler(db_file)
+    db.connect()
+    cur = db.get_cursor()
+    cur.execute("SELECT COUNT(*) FROM accounts WHERE account_id='GROWTH'")
+    assert cur.fetchone()[0] == 1
+    db.disconnect()
+    # YOLO gone
+    assert _holdings(DatabaseHandler(db_file), "YOLO") == pytest.approx(0, abs=1e-6)
+
+
+def test_delete_non_virtual_rejected(tmp_path):
+    db_file = _base_parent_db(tmp_path)
+    rc = cli.account_delete(_ns(db_file, name="1111"))
+    assert rc == 1

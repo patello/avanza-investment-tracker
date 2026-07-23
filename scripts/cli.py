@@ -2365,6 +2365,83 @@ def account_close(args):
     return 0
 
 
+def account_delete(args):
+    """Delete a virtual portfolio and reverse all of its effects.
+
+    Reverts origin='avanza' transactions back to the parent, deletes every
+    origin='virtual' transaction tied to the virtual (including partner legs
+    on other accounts), removes the account row, and reprocesses.
+
+    Unlike 'close', which creates transfer transactions and preserves the
+    account row for history, 'delete' is a clean teardown that leaves no
+    trace of the virtual.
+    """
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+    name = resolve_single_account(db, args.name)
+    if not db.is_virtual_account(name):
+        logging.error(f"'{args.name}' is not a virtual portfolio.")
+        return 1
+    parent = db.get_account_parent(name)
+    if not parent:
+        logging.error(f"Virtual '{name}' has no parent account; cannot determine revert target.")
+        return 1
+
+    # Step 1: Collect (date, asset) pairs from asset-transfer legs on the virtual
+    # so we can clean up partner Sälj/Köp rows on other accounts.
+    cur.execute(
+        "SELECT date, asset_name FROM transactions "
+        "WHERE account = ? AND origin = 'virtual' AND transaction_type IN ('Sälj', 'Köp')",
+        (name,)
+    )
+    transfer_pairs = [(r[0], r[1]) for r in cur.fetchall()]
+
+    # Step 2: Revert real (avanza) transactions to the parent.
+    cur.execute(
+        "UPDATE transactions SET account = ? WHERE account = ? AND origin = 'avanza'",
+        (parent, name)
+    )
+    reverted = cur.rowcount
+
+    # Step 3: Delete all remaining transactions on the virtual (all origin='virtual').
+    cur.execute("DELETE FROM transactions WHERE account = ?", (name,))
+    deleted_on_v = cur.rowcount
+
+    # Step 4: Delete Intern överföring partner legs on other accounts.
+    cur.execute(
+        "DELETE FROM transactions "
+        "WHERE origin = 'virtual' AND transaction_type = 'Intern överföring' "
+        "AND (asset_name = ? OR asset_name = ?)",
+        (f"Transfer to {name}", f"Transfer from {name}")
+    )
+    deleted_partners = cur.rowcount
+
+    # Step 5: Delete asset-transfer partner legs on other accounts.
+    deleted_transfer_legs = 0
+    for tx_date, asset in transfer_pairs:
+        cur.execute(
+            "DELETE FROM transactions "
+            "WHERE origin = 'virtual' AND transaction_type IN ('Sälj', 'Köp') "
+            "AND date = ? AND asset_name = ? AND account != ?",
+            (tx_date, asset, parent)
+        )
+        deleted_transfer_legs += cur.rowcount
+
+    # Step 6: Delete the account row.
+    cur.execute("DELETE FROM accounts WHERE account_id = ?", (name,))
+
+    db.commit()
+    logging.info(
+        f"Deleted virtual '{name}': reverted {reverted} transaction(s) to parent '{parent}', "
+        f"removed {deleted_on_v} synthetic transaction(s) on '{name}', "
+        f"{deleted_partners} transfer partner(s), {deleted_transfer_legs} asset-transfer partner(s)."
+    )
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        return 1
+    return 0
+
+
 def print_account_tree(stat_calc, db):
     """Print account summaries hierarchically: each physical account shows its
     combined (self + virtual children) value, with the children listed indented
@@ -2984,6 +3061,11 @@ Examples:
     ap_close.add_argument('--to', default=None, help="Destination account (default: the sub-portfolio's parent)")
     ap_close.add_argument('--date', required=True, help='Close date (YYYY-MM-DD)')
     ap_close.set_defaults(func=account_close)
+
+    # Delete: clean teardown (revert transactions, remove all traces)
+    ap_delete = account_sub.add_parser('delete', help='Delete a virtual portfolio and reverse all of its effects')
+    ap_delete.add_argument('--name', required=True, help='Virtual sub-portfolio to delete')
+    ap_delete.set_defaults(func=account_delete)
 
     # Nickname management (moved here from `settings account-nickname`)
     ap_nick = account_sub.add_parser('nickname', help='Set, list, or remove account nicknames')

@@ -355,7 +355,7 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 | `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
-| `python scripts/cli.py account SUBCOMMAND` | Manage accounts — virtual sub-portfolios (create/allocate/transfer/list/close) and nicknames (see below) |
+| `python scripts/cli.py account SUBCOMMAND` | Manage accounts — virtual sub-portfolios (create/allocate/transfer/list/close/delete) and nicknames (see below) |
 | `python scripts/cli.py report [OPTIONS]` | Investment report with a virtual-portfolio section and a virtual-vs-parent-vs-benchmark comparison |
 
 ### Global Options
@@ -437,6 +437,7 @@ python cli.py account nickname --remove 1234567
 - **`allocate --to <parent>`** (undo) moves a transaction back from a virtual to the parent and **deletes** the funding transfer pair that was created during the original allocation. No compensating transactions are created. Requires `--from <virtual>`. Partial undo (`--shares`) is not supported.
 - **`transfer`** (asset move) is represented internally as a sell on the source → cash transfer → rebuy on the destination (all tagged as synthetic). This composes the existing transaction handlers and is correct on every statistics path. The **source realizes its gain** up to the transfer and the **destination gets a fresh cost basis** at the transfer price — an honest "this position left / entered the strategy" bookkeeping.
 - **`close`** moves every holding (via the same decomposition) plus any residual cash back to the parent, then reprocesses. The virtual account row is **preserved** (kept `is_virtual = 1`) so its historical cohort/performance data remains queryable; it simply ends up empty.
+- **`delete`** is a clean teardown: reverts all real transactions back to the parent, removes every synthetic transaction tied to the virtual (including partner legs on other accounts), and deletes the account row. Unlike `close`, it leaves no trace — use it to correct a mistake rather than wind down a strategy.
 - After every `account` mutation the cohort tables are rebuilt automatically (same reprocessing as an import).
 
 ### Viewing virtual portfolios
