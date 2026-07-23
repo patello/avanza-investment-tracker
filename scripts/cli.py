@@ -1954,7 +1954,7 @@ def account_create(args):
                 return 1
         else:
             logging.warning("Virtual portfolio created but not funded (insufficient capital on parent).")
-            logging.warning("Fund it later with `virtual transfer-cash`.")
+            logging.warning("Fund it later with `account transfer-cash`.")
     return 0
 
 
