@@ -182,7 +182,25 @@ class DataParser:
         """
         return 0.0 if number_string in ("-", "") else float(number_string.replace(",","."))
     
-    def add_data(self, file_path: str) -> int:
+    def _is_unsettled_trade(self, transaction) -> bool:
+        """Heuristic for an unsettled trade (pending nota) in new-format CSV.
+
+        Avanza includes preliminary same-day buys/sells whose brokerage and FX
+        conversion are not yet finalized; they appear with empty Courtage and
+        empty Valutakurs for non-SEK instruments. Restricted to non-SEK so that
+        legitimate SEK zero-courtage trades are never flagged (issue #78).
+        """
+        if len(transaction) < 10:
+            return False
+        if transaction[2] not in ('Köp', 'Sälj'):
+            return False
+        if transaction[7] == 'SEK':
+            return False
+        courtage_unset = self.convert_number(transaction[8]) == 0.0
+        valutakurs_unset = str(transaction[9]).strip() in ('', '-')
+        return courtage_unset and valutakurs_unset
+
+    def add_data(self, file_path: str, allow_unsettled: bool = False) -> int:
         """
         Takes a path to a csv file downloaded from Avanza and adds the data to the database.
         Uses group-level deduplication to match split/combined transactions.
@@ -247,7 +265,16 @@ class DataParser:
 
         # 3. Parse and group proposed CSV transactions
         proposed_groups = {}
+        unsettled_skipped = []
         for transaction in avanza_data:
+            # Defer unsettled trades (pending nota): same-day exports of non-SEK
+            # buys/sells can have empty Courtage and Valutakurs because brokerage
+            # and FX conversion are not yet finalized. Ingesting them would store
+            # rows with zero courtage and incomplete totals. Skip and warn so the
+            # user re-exports after settlement and re-imports (issue #78).
+            if new_format and not allow_unsettled and self._is_unsettled_trade(transaction):
+                unsettled_skipped.append(transaction)
+                continue
             if new_format:
                 row = (
                     datetime.strptime(transaction[0], "%Y-%m-%d").date(),
@@ -275,6 +302,15 @@ class DataParser:
             if key not in proposed_groups:
                 proposed_groups[key] = []
             proposed_groups[key].append(row)
+
+        if unsettled_skipped:
+            logging.warning(
+                f"Skipping {len(unsettled_skipped)} unsettled trade(s) with pending nota "
+                f"(empty Courtage/Valutakurs on non-SEK buy/sell). "
+                f"Re-export after settlement and re-import:"
+            )
+            for tx in unsettled_skipped:
+                logging.warning(f"  skipped: {tx[0]} {tx[1]} {tx[2]} '{tx[3]}'")
 
         # 4. Perform group-level matching and insertion
         for key, proposed_rows in proposed_groups.items():

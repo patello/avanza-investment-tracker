@@ -109,7 +109,7 @@ def import_data(args):
     
     try:
         # Import data
-        rows_added = data_parser.add_data(args.file)
+        rows_added = data_parser.add_data(args.file, allow_unsettled=getattr(args, 'allow_unsettled', False))
         logging.info(f"Added {rows_added} rows to the database")
 
         # Auto-route sells and distribute dividends to the accounts that
@@ -2767,6 +2767,10 @@ Examples:
     import_parser.add_argument(
         '--allocate-virtual', action='store_true',
         help='Auto-allocate buys to virtual portfolios using cash + holdings heuristics'
+    )
+    import_parser.add_argument(
+        '--allow-unsettled', action='store_true',
+        help='Import pending-nota trades (non-SEK buy/sell with empty Courtage/Valutakurs) instead of deferring them'
     )
     import_parser.set_defaults(func=import_data)
     
