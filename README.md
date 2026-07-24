@@ -352,15 +352,26 @@ python cli.py portfolio --account "account1" --apy-mode twrr
 
 | Command | Description |
 | :--- | :--- |
-| `python scripts/cli.py import FILE [--allocate-virtual]` | Import transaction entries from Avanza CSV (auto-allocate buys to virtuals) |
+| `python scripts/cli.py import FILE [--allocate-virtual] [--allow-unsettled]` | Import transaction entries from Avanza CSV (auto-allocate buys to virtuals; defers unsettled/pending-nota trades — see CSV Format Support) |
 | `python scripts/cli.py stats [OPTIONS]` | Calculate and display cohort performance statistics (TWRR, deposits) |
 | `python scripts/cli.py accounts [OPTIONS]` | Display summary of all accounts with asset values and cash |
 | `python scripts/cli.py portfolio [OPTIONS]` | Show portfolio holdings, market value, allocation %, and APY (alias to `stats --positions --summary`) |
 | `python scripts/cli.py status` | Display system status (transaction counts, price dates, date range) |
 | `python scripts/cli.py settings SUBCOMMAND` | Configure defaults and account nicknames |
 | `python scripts/cli.py reset [--hard]` | Reset database state (`--hard` deletes data; default only marks unprocessed) |
+| `python scripts/cli.py delete-tx [OPTIONS]` | Delete individual transaction(s) by `--tx-id`, `--date`+`--asset`, or `--since`, then rebuild derived tables (see below) |
 | `python scripts/cli.py account SUBCOMMAND` | Manage accounts — virtual sub-portfolios (create/allocate/transfer/list/close/delete) and nicknames (see below) |
 | `python scripts/cli.py report [OPTIONS]` | Investment report with a virtual-portfolio section and a virtual-vs-parent-vs-benchmark comparison |
+
+### Deleting transactions
+
+`delete-tx` removes specific real transactions and rebuilds the derived `assets` / cohort tables, so there is no need to `reset` the whole database after a bad import (e.g. a duplicate, or a row that slipped in before an unsettled trade was deferred). Targeting is mutually exclusive:
+
+- `delete-tx --tx-id ROWID` — most precise (use `status`/`export` to find the rowid).
+- `delete-tx --date YYYY-MM-DD --asset "Name" [--account ACCOUNT]` — the common surgical case.
+- `delete-tx --since YYYY-MM-DD [--account ACCOUNT]` — remove everything from a date onward (e.g. undo today's import).
+
+`--cascade` widens a `--date`+`--asset` match across the account family (parent + its virtuals) so a trade and its allocated split are removed together; `--dry-run` previews the deletion. When an allocated buy on a virtual is deleted, its orphaned funding `Intern överföring` transfer is removed automatically (mirroring `account allocate --undo`). After every deletion all transactions are reprocessed, so the `assets`/cohort tables always reflect the remaining transactions — never a half-deleted state.
 
 ### Global Options
 - `--database PATH` (default: `data/asset_data.db`)

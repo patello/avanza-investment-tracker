@@ -1182,6 +1182,135 @@ def status(args):
     return 0
 
 
+def delete_tx(args):
+    """Delete individual transaction(s) and rebuild derived tables (issue #80).
+
+    Targets real (origin='avanza') transactions via --date+--asset, --since, or a
+    precise --tx-id. 'Intern överföring' funding transfers left orphaned by a
+    deleted allocated buy are removed too (mirroring 'account allocate --undo').
+    --cascade widens the match across the account family (same date+asset) so a
+    trade and its allocated split are removed together. After the delete, every
+    transaction is reprocessed so the assets/cohort tables are rebuilt cleanly --
+    there is no path to the orphaned state where derived tables still reflect a
+    deleted transaction.
+    """
+    db = get_db(args)
+    db.connect()
+    cur = db.get_cursor()
+
+    # --- flag validation ---
+    if args.asset and not args.date:
+        logging.error("--asset can only be used together with --date.")
+        return 1
+    if args.account and args.tx_id is not None:
+        logging.error("--account cannot be combined with --tx-id (the rowid is already precise).")
+        return 1
+
+    select_cols = "rowid, date, account, transaction_type, asset_name, amount, total, origin"
+    real = "AND (origin = 'avanza' OR origin IS NULL)"
+
+    if args.tx_id is not None:
+        row = cur.execute(
+            f"SELECT {select_cols} FROM transactions WHERE rowid = ?", (args.tx_id,)
+        ).fetchone()
+        if not row:
+            logging.error(f"No transaction with rowid {args.tx_id}.")
+            return 1
+        matched = [row]
+    elif args.since:
+        since = _parse_exact_date(args.since)
+        q = f"SELECT {select_cols} FROM transactions WHERE date >= ? {real}"
+        params = [since]
+        if args.account:
+            q += " AND account = ?"
+            params.append(resolve_single_account(db, args.account))
+        matched = list(cur.execute(q + " ORDER BY rowid", params).fetchall())
+    else:  # --date + --asset
+        if not args.asset:
+            logging.error("--date requires --asset (use --tx-id or --since otherwise).")
+            return 1
+        target_date = _parse_exact_date(args.date)
+        q = f"SELECT {select_cols} FROM transactions WHERE date = ? AND asset_name = ? {real}"
+        params = [target_date, args.asset.strip()]
+        if args.account:
+            q += " AND account = ?"
+            params.append(resolve_single_account(db, args.account))
+        matched = list(cur.execute(q + " ORDER BY rowid", params).fetchall())
+
+    if not matched:
+        logging.error("No matching transaction(s) found.")
+        return 1
+
+    virtual_map = db.get_virtual_map()
+
+    # --- cascade: widen the match across the account family by (date, asset_name) ---
+    if args.cascade:
+        seen = {m[0] for m in matched}
+        for m in list(matched):
+            tx_date, asset_name = m[1], m[4]
+            for acct in _account_family(m[2], virtual_map):
+                for r in cur.execute(
+                        f"SELECT {select_cols} FROM transactions "
+                        "WHERE date = ? AND asset_name = ? AND account = ? " + real,
+                        (tx_date, asset_name, acct)):
+                    if r[0] not in seen:
+                        matched.append(r)
+                        seen.add(r[0])
+
+    matched_rowids = {m[0] for m in matched}
+
+    # --- funding-transfer cleanup for deleted allocated buys (mirrors allocate --undo) ---
+    fund_pair_rowids = set()
+    for m in matched:
+        rowid, tx_date, acct, ttype, asset_name, amount, total, origin = m
+        if ttype == 'Köp' and acct in virtual_map:
+            parent = virtual_map[acct]
+            fund_date = tx_date - timedelta(days=1)
+            for r in cur.execute(
+                    f"SELECT {select_cols} FROM transactions "
+                    "WHERE transaction_type = 'Intern överföring' AND origin = 'virtual' "
+                    "AND date = ? AND (account = ? OR account = ?)",
+                    (fund_date, acct, parent)):
+                fund_pair_rowids.add(r[0])
+
+    def _fmt(r):
+        return (f"rowid={r[0]} {r[1]} {r[2]} {r[3]} '{r[4]}' "
+                f"amount={r[5]} total={r[6]} ({r[7]})")
+
+    logging.info(f"Will delete {len(matched_rowids)} transaction(s):")
+    for m in matched:
+        logging.info("  " + _fmt(m))
+    if fund_pair_rowids:
+        fund_rows = cur.execute(
+            f"SELECT {select_cols} FROM transactions WHERE rowid IN "
+            f"({','.join('?' * len(fund_pair_rowids))}) ORDER BY rowid",
+            tuple(fund_pair_rowids)).fetchall()
+        logging.info(f"And {len(fund_pair_rowids)} orphaned virtual funding transfer(s):")
+        for r in fund_rows:
+            logging.info("  " + _fmt(r))
+
+    if args.dry_run:
+        logging.info("[dry-run] No changes written. Re-run without --dry-run to apply.")
+        return 0
+
+    all_ids = matched_rowids | fund_pair_rowids
+    placeholders = ",".join("?" * len(all_ids))
+    cur.execute(f"DELETE FROM transactions WHERE rowid IN ({placeholders})", tuple(all_ids))
+    deleted = cur.rowcount
+    db.commit()
+    logging.info(f"Deleted {deleted} transaction row(s).")
+
+    if reprocess_after_virtual_change(db, getattr(args, 'special_cases', None)) != 0:
+        logging.error(
+            "Reprocessing failed after deletion (e.g. a sell left without its matching "
+            "buy). The rows are deleted but derived tables need attention; inspect the "
+            "logs and re-import or adjust."
+        )
+        return 1
+    logging.info("Derived tables rebuilt.")
+    return 0
+
+
 def reset(args):
     """Reset database state."""
     db = get_db(args)
@@ -3110,6 +3239,25 @@ Examples:
         help='Hard reset: delete all transactions, stats, and prices'
     )
     reset_parser.set_defaults(func=reset)
+
+    # delete-tx command (issue #80)
+    deltx_parser = subparsers.add_parser(
+        'delete-tx',
+        help='Delete individual transaction(s) and rebuild derived tables')
+    deltx_mode = deltx_parser.add_mutually_exclusive_group(required=True)
+    deltx_mode.add_argument('--tx-id', type=int,
+        help='Delete a single transaction by internal rowid (most precise)')
+    deltx_mode.add_argument('--date',
+        help='Exact date YYYY-MM-DD (requires --asset)')
+    deltx_mode.add_argument('--since',
+        help='Delete all transactions on/after YYYY-MM-DD (optionally filtered by --account)')
+    deltx_parser.add_argument('--asset', help='Asset name to match (requires --date)')
+    deltx_parser.add_argument('--account', help='Restrict matching to one account (id or nickname)')
+    deltx_parser.add_argument('--cascade', action='store_true',
+        help='Also delete related rows across the account family (same date+asset)')
+    deltx_parser.add_argument('--dry-run', action='store_true',
+        help='Show what would be deleted without writing')
+    deltx_parser.set_defaults(func=delete_tx)
 
     args = parser.parse_args()
 
