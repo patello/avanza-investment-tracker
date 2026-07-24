@@ -296,6 +296,8 @@ The parser automatically detects whether your CSV file uses Avanza's old or new 
 
 Empty numeric fields (like `Antal`, `Kurs`) are treated as zero.
 
+**Asset name normalization:** Instrument names are trimmed of leading/trailing whitespace on import — Avanza exports occasionally include stray trailing spaces that would otherwise break exact-name lookups (e.g. `account allocate`). Any pre-existing names are normalized automatically the next time the database is opened.
+
 **Price fetching note:** The `stats` command (with `--update-prices auto` or `--update-prices always`) fetches current asset prices from Avanza's public search API (`www.avanza.se/_api/search/filtered-search`). This API is intended for web frontend use and may have rate limits or terms of service restrictions. Use at your own risk and consider using official APIs if available. Always review the website's terms of service before using their data.
 
 ### Using the CLI (Recommended)

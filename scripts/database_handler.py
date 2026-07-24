@@ -245,6 +245,15 @@ class DatabaseHandler:
                 FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
                 );""")
 
+        # Migrate: normalize asset names (trim leading/trailing whitespace).
+        # Avanza CSV exports occasionally contain instrument names with stray
+        # whitespace (issue #79), which breaks exact-name lookups (e.g. account
+        # allocate). Trim both transactions.asset_name and assets.asset so the
+        # asset_prices backfill below (which JOINs on the name) matches cleanly.
+        # Idempotent: the WHERE clause makes re-runs on already-clean data a no-op.
+        cursor.execute("UPDATE transactions SET asset_name = trim(asset_name) WHERE asset_name != trim(asset_name)")
+        cursor.execute("UPDATE assets SET asset = trim(asset) WHERE asset != trim(asset)")
+
         # Retroactive Migration: populate asset_prices with historical transaction prices from processed transactions
         cursor.execute("""
             INSERT OR IGNORE INTO asset_prices (asset_id, price_date, price, source)

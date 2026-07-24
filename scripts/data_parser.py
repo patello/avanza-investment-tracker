@@ -251,7 +251,7 @@ class DataParser:
             if new_format:
                 row = (
                     datetime.strptime(transaction[0], "%Y-%m-%d").date(),
-                    transaction[1], transaction[2], transaction[3],
+                    transaction[1], transaction[2], transaction[3].strip(),
                     self.convert_number(transaction[4]), self.convert_number(transaction[5]),
                     self.convert_number(transaction[6]), self.convert_number(transaction[8]),
                     transaction[7], transaction[11]
@@ -259,7 +259,7 @@ class DataParser:
             else:
                 row = (
                     datetime.strptime(transaction[0], "%Y-%m-%d").date(),
-                    transaction[1], transaction[2], transaction[3],
+                    transaction[1], transaction[2], transaction[3].strip(),
                     self.convert_number(transaction[4]), self.convert_number(transaction[5]),
                     self.convert_number(transaction[6]), self.convert_number(transaction[7]),
                     transaction[8], transaction[9]
